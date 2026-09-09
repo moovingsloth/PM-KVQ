@@ -15,7 +15,7 @@ def get_max_keys(model, calib_dataset, effective_len=None, save_path=None):
     else:
         position_ids = None
 
-    for example in tqdm(calib_dataset, desc="Getting max keys", unit="sample"):
+    for example in tqdm(calib_dataset, desc="Getting max keys", unit="sample", dynamic_ncols=True):
         outputs = model(torch.tensor([example["input_ids"]], device=model.device), position_ids=position_ids, use_cache=True)
         past_keys = outputs.past_key_values.key_cache
         for i, key in enumerate(past_keys):

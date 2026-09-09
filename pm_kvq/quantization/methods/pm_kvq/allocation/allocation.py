@@ -56,9 +56,12 @@ def allocate_memory_budget(fbit_choices=[8, 4, 2], k_sensitivity=None, v_sensiti
     prob = cp.Problem(objective, constraints)
     prob.solve(solver=cp.SCIPY)
 
+    if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or x.value is None:
+        raise ValueError(f"Memory allocation failed: {prob.status}; budget={memory_budget} MiB")
+
     optimal_idx = x.value.reshape(-1, len(fbit_choices)).argmax(axis=1)
     optimal_bitwidth = choices_item.reshape(-1, len(fbit_choices))[np.arange(len(optimal_idx)), optimal_idx]
-    optimal_budget = [kv_mem_per_layer[n_bits] for n_bits in optimal_idx]
+    optimal_budget = [float(kv_mem_per_layer[n_bits]) for n_bits in optimal_idx]
 
     if save_path is not None:
         torch.save(optimal_budget, save_path)

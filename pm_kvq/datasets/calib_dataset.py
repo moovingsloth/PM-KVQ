@@ -1,10 +1,11 @@
 from datasets import load_dataset, Dataset
+from tqdm import tqdm
 
 
 def get_calib_redpajama(path, n_samples, seq_len, tokenizer, seed=42):
     dataset = load_dataset(path, split="train").select(range(1510)).remove_columns("meta").shuffle(seed=seed)
     all_tokens = []
-    for example in dataset:
+    for example in tqdm(dataset, desc="Tokenizing calibration data", unit="doc", dynamic_ncols=True):
         text = example["text"]
         tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
         all_tokens.extend(tokens)

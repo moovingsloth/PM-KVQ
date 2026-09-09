@@ -2,6 +2,7 @@ import sys
 from copy import deepcopy
 
 import torch
+from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 DEFAULT_GENERATION_KWARGS = {
@@ -18,6 +19,18 @@ from torch import nn
 from transformers import Cache, GenerationConfig, LogitsProcessorList
 from transformers.generation.streamers import BaseStreamer
 from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput, GenerateNonBeamOutput
+
+
+class TokenProgressCriteria(StoppingCriteria):
+    def __init__(self, total):
+        self.pbar = tqdm(total=total, desc="Generating", unit="tok", dynamic_ncols=True, mininterval=0.2)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        self.pbar.update(1)
+        return False
+
+    def close(self):
+        self.pbar.close()
 
 
 class PrintTokenStoppingCriteria(StoppingCriteria):
@@ -55,12 +68,20 @@ def chat(model, tokenizer, text, print_response=False, return_len=False, **kwarg
 
     generation_kwargs = deepcopy(DEFAULT_GENERATION_KWARGS)
     generation_kwargs.update(kwargs)
-    outputs = model.generate(
-        inputs["input_ids"],
-        pad_token_id=tokenizer.eos_token_id,
-        stopping_criteria=stop_list,
-        **generation_kwargs,
-    )
+    progress = None
+    if not print_response:
+        progress = TokenProgressCriteria(generation_kwargs.get("max_new_tokens", 8192))
+        stop_list.append(progress)
+    try:
+        outputs = model.generate(
+            inputs["input_ids"],
+            pad_token_id=tokenizer.eos_token_id,
+            stopping_criteria=stop_list,
+            **generation_kwargs,
+        )
+    finally:
+        if progress is not None:
+            progress.close()
     decoded_text = tokenizer.decode(outputs[0][inputs_len:], skip_special_tokens=True)
     if return_len:
         outputs_len = len(outputs[0]) - inputs_len
@@ -182,7 +203,7 @@ def _sample(
 
     is_prefill = True
     try:
-        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length):
+        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -252,7 +273,8 @@ def _sample(
             # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
             del outputs
     except MemoryError:
-        pass
+        # An exhausted KV budget must not be scored as a completed response.
+        raise
 
     if streamer is not None:
         streamer.end()

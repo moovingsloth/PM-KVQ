@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup, find_namespace_packages
 
 setup(
     name="pm_kvq",
@@ -6,7 +6,7 @@ setup(
     author="Tengxuan Liu",
     author_email="liutx21@mails.tsinghua.edu.cn",
     description="PM-KVQ: Progressive Mixed-precision KV Cache Quantization for Long-CoT LLMs",
-    packages=find_packages(),
+    packages=find_namespace_packages(include=["pm_kvq", "pm_kvq.*"]),
     classifiers=[
         "Programming Language :: Python :: 3",
         "Operating System :: OS Independent",

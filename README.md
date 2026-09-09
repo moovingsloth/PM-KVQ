@@ -27,6 +27,109 @@ Recently, significant progress has been made in developing reasoning-capable Lar
 
 4. For RotateKV baseline, install `fast-hadamard-transform` from [Dao-AILab/fast-hadamard-transform](https://github.com/Dao-AILab/fast-hadamard-transform).
 
+## GB10 smoke test: R1-Qwen-14B on AIME2025
+
+Use the existing Conda environment; `uv` is not required. Run from this repository:
+
+```bash
+cd /home/dongwon/workspace/emil/pm-pkv
+conda activate pm_kvq
+export HF_HOME=/home/dongwon/workspace/emil/pm-pkv/.cache/huggingface
+export HF_XET_CACHE="$HF_HOME/xet"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+python -c 'import torch; print(torch.__version__, torch.cuda.is_available()); x = torch.randn(128, 128, device="cuda"); print((x @ x).mean().item())'
+```
+
+`requirements.txt` pins `torch==2.5.1`. On this ARM64 GB10 host that pin
+installs a CPU-only wheel (`2.5.1 False`), so the check raises
+`AssertionError: Torch not compiled with CUDA enabled`. The driver reports
+CUDA 13.0; there is no aarch64 CUDA wheel for 2.5.1.
+
+Install the CUDA 13.0 build below in the same Conda environment. Leave
+`transformers==4.51.3` unchanged; `torch==2.9.1` does not require a newer
+Transformers. This repo copies 4.51-era Qwen2/Llama attention and cache
+internals and monkey-patches `model._sample`. That copy was already adjusted
+for 4.51.3's `_has_unfinished_sequences(this_peer_finished, synced_gpus, device)`
+signature (the 4.49 form also passed `cur_len` and `max_length`). A further
+Transformers bump would break those hooks and the paired
+`tokenizers>=0.21,<0.22` pin. Reinstall `pm_kvq` with `--no-deps`. Do not
+reinstall `requirements.txt` afterward, because that restores the CPU-only
+PyTorch pin.
+
+```bash
+python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install -e . --no-deps
+```
+
+The check then prints `2.9.1+cu130 True` and a matmul mean, on device
+`NVIDIA GB10`. PyTorch 2.9.1+cu130 ships kernels through sm_120 plus PTX;
+GB10 is sm_121, so CUDA init warns that the GPU is outside the wheel's
+(8.0)–(12.0) range. The matmul still runs.
+
+Local reusable assets (not the network mount):
+
+| Asset | Location |
+| --- | --- |
+| AIME2025 I and II | `/home/dongwon/workspace/datasets/aime/` |
+| RedPajama calibration source | `/home/dongwon/workspace/datasets/redpajama-1t-sample/` |
+| Selected model | `/home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B/` |
+| Run artifacts and logs | `/home/dongwon/workspace/emil/pm-pkv/outputs/smoke/` |
+
+The cache exports override any inherited mount-based Hugging Face configuration.
+The smoke runner sets these same local cache paths automatically.
+The datasets were copied from the existing local repository assets. To obtain
+the selected model at the path above (also resumes an incomplete download):
+
+```bash
+python -c 'from huggingface_hub import snapshot_download; snapshot_download("deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", local_dir="/home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B")'
+```
+
+Run the smoke pipeline with the Conda interpreter that has the CUDA 13.0
+PyTorch build. The runner sets `HF_HOME` and related cache paths itself.
+
+```bash
+cd /home/dongwon/workspace/emil/pm-pkv
+conda activate pm_kvq
+/home/dongwon/miniconda3/envs/pm_kvq/bin/python scripts/smoke_aime2025.py \
+  --model_path /home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B \
+  --dataset_root /home/dongwon/workspace/datasets
+```
+
+Optional: `--output_dir /path/to/run` writes artifacts to a chosen directory
+instead of `outputs/smoke/<YYYYMMDD-HHMMSS>/`. The directory must not already
+exist. A completed example is `outputs/smoke/20260909-151318`.
+
+This runs sensitivity profiling, memory allocation, key calibration, scale
+search, then BF16 and PM-KVQ evaluation of problem 1 from each AIME2025 subset
+(indices 0 and 15), with one response per problem. It creates a new timestamped
+output directory and records each command, exit code, elapsed time and response.
+Failure stops the pipeline; inspect the named stage log before rerunning.
+
+Settings follow the [original paper](https://arxiv.org/html/2505.18610v1):
+2,048-token calibration sequences, effective length 8,192, 20-point scale search,
+2-bit scale calibration, layer choices `{2,4}`, and the Qwen-14B mixed-precision
+budget ratio of 16/12 relative to the 2-bit budget at 32,768 tokens (1,024 MiB per
+request). Generation uses temperature 0.6, top-p 0.95, seed 42 and a 32,768-token
+output limit. Inference is sequential on GB10, not a throughput reproduction of
+the paper's batch-size-12 configuration. Calibration uses **8 samples instead of
+512**, and evaluation uses **2 problems × 1 response instead of 30 × 16**.
+These reductions make this a pipeline smoke test, not a reproduction of the
+reported benchmark score. The fake backend simulates quantization numerically;
+its allocations are not evidence of physically compressed GPU memory.
+
+The original judge prints `incomplete test data:2/480` for each method; that is
+expected for this subset. Responses are JSON objects despite older instructions
+calling them JSONL. Keep only response files in each method's response directory.
+Each response records elapsed time and token-limit status; PM-KVQ responses also
+record the cache bit counts for each layer. `summary.json` reports whether actual
+quantization occurred. A short response may finish before the first transition.
+
+The smoke workflow includes compatibility fixes for the pinned Transformers
+sampler API, budget-file CLI arguments, direct application of calibrated scales,
+and safe loading of newly generated budget artifacts with modern PyTorch.
+KV-budget exhaustion now raises an error instead of silently scoring an
+unfinished generation.
+
 ## Apply PM-KVQ
 
 ### Block-wise Memory Allocation

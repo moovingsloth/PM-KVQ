@@ -8,6 +8,7 @@ from pm_kvq.evaluation.eval_wrapper import evaluate_model
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, help="Path to the model")
+parser.add_argument("--dataset_path", type=str, default=None, help="Local benchmark dataset directory")
 parser.add_argument("--output_path", type=str, help="Path to the output .jsonl file")
 parser.add_argument("--benchmark", type=str, help="Benchmark name", default="aime", choices=["aime", "cmimc", "livecodebench"])
 parser.add_argument("--version", type=str, help="Benchmark version", default="2024")
@@ -24,7 +25,12 @@ if args.method == "original":
 elif args.method == "pm-kvq":
     parser.add_argument("--backend", help="Backend to implement PM-KVQ", type=str, default="fake", choices=["fake", "real"])
     parser.add_argument("--rep_scales", help="Path to reparameterization scales", type=str, default=None)
-    parser.add_argument("--kv_budgets", help="Path to KV Cache budgets", type=float)
+    def budget_value(value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    parser.add_argument("--kv_budgets", help="Budget artifact path or per-layer MB", type=budget_value, required=True)
     parser.add_argument("--n_sink_token", help="Number of sink tokens", type=int, default=1)
     parser.add_argument("--n_sink_token_bits", help="Bit-width of sink tokens", type=int, default=16)
     parser.add_argument("--n_window_token", help="Number of tokens in sliding window", type=int, default=128)
@@ -56,9 +62,12 @@ else:
 
 args = parser.parse_args()
 args_dict = vars(args)
+dataset_path = args_dict.pop("dataset_path")
 method_kwargs = {key: args_dict[key] for key in args_dict if key not in ["model_path", "output_path", "seed", "benchmark", "version", "start", "end", "n_responses", "method"]}
 evaluate_kwargs = {key: args_dict[key] for key in args_dict if key in ["output_path", "seed", "version", "start", "end", "n_responses"]}
 generation_kwargs = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 32768, "do_sample": True}
+if dataset_path is not None:
+    evaluate_kwargs["dataset_path"] = dataset_path
 
 model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="auto", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
