@@ -99,6 +99,20 @@ Optional: `--output_dir /path/to/run` writes artifacts to a chosen directory
 instead of `outputs/smoke/<YYYYMMDD-HHMMSS>/`. The directory must not already
 exist. A completed example is `outputs/smoke/20260909-151318`.
 
+Smoke runs log to
+[Weights & Biases `pm-kvq`](https://wandb.ai/dlehddnjs245-kyung-hee-university/pm-kvq)
+by default (entity `dlehddnjs245-kyung-hee-university`). Credentials come from
+`WANDB_API_KEY`, `~/.env`, or an existing `wandb login` (`~/.netrc`). Pass
+`--no-wandb` to skip logging. Override the destination with `--wandb_entity`,
+`--wandb_project`, `--wandb_name`, or the `WANDB_ENTITY` / `WANDB_PROJECT` /
+`WANDB_NAME` environment variables. To publish an already-finished output
+directory without rerunning:
+
+```bash
+/home/dongwon/miniconda3/envs/pm_kvq/bin/python scripts/smoke_aime2025.py \
+  --log_existing outputs/smoke/20260909-151318
+```
+
 This runs sensitivity profiling, memory allocation, key calibration, scale
 search, then BF16 and PM-KVQ evaluation of problem 1 from each AIME2025 subset
 (indices 0 and 15), with one response per problem. It creates a new timestamped
@@ -110,12 +124,43 @@ Settings follow the [original paper](https://arxiv.org/html/2505.18610v1):
 2-bit scale calibration, layer choices `{2,4}`, and the Qwen-14B mixed-precision
 budget ratio of 16/12 relative to the 2-bit budget at 32,768 tokens (1,024 MiB per
 request). Generation uses temperature 0.6, top-p 0.95, seed 42 and a 32,768-token
-output limit. Inference is sequential on GB10, not a throughput reproduction of
-the paper's batch-size-12 configuration. Calibration uses **8 samples instead of
-512**, and evaluation uses **2 problems × 1 response instead of 30 × 16**.
-These reductions make this a pipeline smoke test, not a reproduction of the
-reported benchmark score. The fake backend simulates quantization numerically;
-its allocations are not evidence of physically compressed GPU memory.
+output limit. Calibration uses **8 samples instead of 512**, and evaluation uses
+**2 problems × 1 response instead of 30 × 16**. These reductions make this a
+pipeline smoke test, not a reproduction of the reported benchmark score.
+
+Paper Table 2 batch sizes for Qwen-14B are a **target-GPU memory scenario**,
+not the evaluation loop. On `1×A100-40G` the 14B BF16 weights leave about 12 GiB
+for a 32,768-token KV cache, which fills at **BS=16** with uniform 2-bit
+(768 MiB/request) or **BS=12** with mixed 2/4 (1,024 MiB/request). Uniform 4-bit
+would need 1,536 MiB/request and does not fit that leftover. Accuracy in that
+table is fake-quantized; the 12/16 figures set the per-request budget, not a
+requirement to call `generate` with a batch of 12.
+
+This host is **NVIDIA GB10** with 121.6 GiB unified memory. The 14B weights are
+27.5 GiB, leaving about 94 GiB. Matching the paper's *bit-width* row still
+means 1,024 MiB/request (BS=12 mixed) or 768 MiB/request (BS=16 2-bit). The
+smoke runner already uses 1,024 MiB and generates **one sequence at a time**.
+Do not raise that budget just because GB10 is larger; a larger budget changes
+the quantization schedule and is no longer the paper's 2/4 row.
+
+If GB10 is treated as the target GPU and leftover memory is filled at 32,768
+tokens (activations and OS not counted):
+
+| KV storage | Setup | Per-request KV @32k | Batch that fills ~94 GiB |
+| --- | --- | --- | --- |
+| fake (current smoke) | tensors stay BF16-sized | 6,144 MiB | ~15 |
+| packed `real` | mixed 2/4 (paper BS=12 budget) | 1,024 MiB | ~94 |
+| packed `real` | uniform 2-bit (paper BS=16 budget) | 768 MiB | ~125 |
+| packed `real` | uniform 4-bit | 1,536 MiB | ~62 |
+| original BF16 | 16-bit KV | 6,144 MiB | ~15 |
+
+So on this GPU, fake 32k serving is about **BS=12–16**, coincidentally the
+paper's A100-40G *quantized* batch, because fake does not shrink the tensors.
+Packed `real` could go much higher at the same 1,024 MiB/request. The
+evaluation scripts do not take `--batch_size`; progressive PM-KVQ bit state is
+per-layer, not per-sequence, so those larger batches are not wired up. The fake
+backend simulates quantization numerically; its allocations are not evidence
+of physically compressed GPU memory.
 
 The original judge prints `incomplete test data:2/480` for each method; that is
 expected for this subset. Responses are JSON objects despite older instructions
