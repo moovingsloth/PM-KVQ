@@ -6,3 +6,5 @@ accelerate==1.4.0
 cvxpy
 pyext
 wandb
+matplotlib
+pillow

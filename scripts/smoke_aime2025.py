@@ -1,5 +1,6 @@
 """Run the R1-Qwen-14B BF16/PM-KVQ smoke pipeline using the active Conda Python."""
 import argparse
+import codecs
 import datetime
 import fcntl
 import json
@@ -17,16 +18,56 @@ from pm_kvq.utils.wandb_logging import (
     DEFAULT_ENTITY,
     DEFAULT_PROJECT,
     PROJECT_URL,
+    ConsoleCollapser,
     child_env,
+    copy_into_run,
+    emit_console,
     init_smoke_run,
+    make_console_emitter,
     log_smoke_outputs,
     log_stage,
     publish_existing_run,
-    save_live,
     wandb_config_from_metadata,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+PRESETS = {
+    'smoke': {'n_samples': 8, 'n_responses': 1, 'slices': [(0, 1), (15, 16)]},
+    'day': {'n_samples': 8, 'n_responses': 4, 'slices': [(0, 5), (15, 20)]},
+    'full': {'n_samples': 512, 'n_responses': 16, 'slices': [(0, 30)]},
+}
+
+
+def _problem_id(index):
+    if index < 15:
+        return 'I', index + 1
+    return 'II', index - 14
+
+
+def _expected_keys(slices, n_responses):
+    return {
+        f'aime_2025_{subset}.{problem}.{response}'
+        for start, end in slices
+        for index in range(start, end)
+        for subset, problem in [_problem_id(index)]
+        for response in range(n_responses)
+    }
+
+
+def _eval_jobs(method, slices, out):
+    jobs = []
+    for start, end in slices:
+        if end - start == 1:
+            name = f'{method}_{start}'
+            path = out / method / f'{start}.json'
+        elif slices == [(0, 30)]:
+            name = f'{method}_evaluation'
+            path = out / method / 'responses.json'
+        else:
+            name = f'{method}_{start}_{end}'
+            path = out / method / f'{start}_{end}.json'
+        jobs.append((name, start, end, path))
+    return jobs
 
 
 def _set_winsize(fd):
@@ -42,14 +83,19 @@ def _set_winsize(fd):
         pass
 
 
-def _tee_pty(cmd, log, cwd, env):
-    """Run cmd on a PTY so tqdm/HF bars render, and copy output to the log."""
+def _tee_pty(cmd, log, cwd, env, emit=emit_console):
+    """Run cmd on a PTY so tqdm/HF bars render, and copy output to the log.
+
+    Collapsed text is emitted to the terminal and to W&B Logs while the child runs.
+    """
     master, slave = pty.openpty()
     _set_winsize(slave)
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.STDOUT, close_fds=True)
     finally:
         os.close(slave)
+    decoder = codecs.getincrementaldecoder('utf-8')('replace')
+    collapser = ConsoleCollapser(emit)
     try:
         while True:
             try:
@@ -58,10 +104,15 @@ def _tee_pty(cmd, log, cwd, env):
                 break
             if not chunk:
                 break
-            sys.stdout.write(chunk.decode('utf-8', 'replace'))
-            sys.stdout.flush()
             log.write(chunk)
             log.flush()
+            text = decoder.decode(chunk)
+            if text:
+                collapser.feed(text, live=True)
+        tail = decoder.decode(b'', final=True)
+        if tail:
+            collapser.feed(tail, live=True)
+        collapser.flush()
     finally:
         os.close(master)
     return proc.wait()
@@ -69,9 +120,13 @@ def _tee_pty(cmd, log, cwd, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--preset', choices=sorted(PRESETS), default='smoke',
+                        help='smoke: 8 calib samples, AIME I.1 and II.1, 1 response. '
+                             'day: 8 calib samples, 10 problems × 4 responses (~0.5–1 day). '
+                             'full: 512 calib samples, 30 problems × 16 responses')
     parser.add_argument('--model_path', default='/home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B')
     parser.add_argument('--dataset_root', default='/home/dongwon/workspace/datasets')
-    parser.add_argument('--output_dir', default=str(ROOT / 'outputs' / 'smoke' / datetime.datetime.now().strftime('%Y%m%d-%H%M%S')))
+    parser.add_argument('--output_dir', default=None)
     parser.add_argument('--wandb', dest='wandb', action='store_true', default=True,
                         help=f'Log this run to {PROJECT_URL} (default)')
     parser.add_argument('--no-wandb', dest='wandb', action='store_false',
@@ -82,6 +137,9 @@ def main():
     parser.add_argument('--log_existing', default=None,
                         help='Publish an already-finished output directory to W&B without rerunning')
     args = parser.parse_args()
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    if args.output_dir is None:
+        args.output_dir = str(ROOT / 'outputs' / args.preset / stamp)
     if args.log_existing:
         url = publish_existing_run(
             Path(args.log_existing),
@@ -114,10 +172,16 @@ def main():
     # Paper Qwen-14B mixed 2/4 row on A100-40G: 2-bit@32k * (BS16/BS12) = 1024 MiB/request.
     # GB10 leftover ~94 GiB does not change this per-request budget.
     budget = config['num_hidden_layers'] * kv_dim * 2 * 32768 * 2 / 8 / 2**20 * 16 / 12
-    metadata = dict(model_path=str(model), dataset_root=str(data), torch=torch.__version__,
-                    transformers=transformers.__version__, gpu=torch.cuda.get_device_name(0),
-                    calibration_samples=8, seq_len=2048, effective_len=8192,
-                    memory_budget_mb=budget, problem_indices=[0, 15], n_responses=1,
+    preset = PRESETS[args.preset]
+    n_samples = preset['n_samples']
+    n_responses = preset['n_responses']
+    slices = preset['slices']
+    problem_indices = [index for start, end in slices for index in range(start, end)]
+    metadata = dict(preset=args.preset, model_path=str(model), dataset_root=str(data),
+                    torch=torch.__version__, transformers=transformers.__version__,
+                    gpu=torch.cuda.get_device_name(0), calibration_samples=n_samples,
+                    seq_len=2048, effective_len=8192, memory_budget_mb=budget,
+                    problem_indices=problem_indices, n_responses=n_responses,
                     seed=42, max_new_tokens=32768, temperature=0.6, top_p=0.95,
                     backend='fake', status='running', stages=[])
     metadata['git_revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -132,15 +196,17 @@ def main():
         wandb_run = init_smoke_run(
             entity=args.wandb_entity,
             project=args.wandb_project,
-            name=args.wandb_name or f'smoke-{out.name}',
+            name=args.wandb_name or f'{args.preset}-{out.name}',
             config=wandb_config_from_metadata(metadata),
+            job_type=args.preset,
         )
         print(f'W&B: {wandb_run.url}', flush=True)
-        save_live(out / 'metadata.json', out)
+        copy_into_run(wandb_run, out / 'metadata.json')
+    emit = make_console_emitter(wandb_run)
     env = child_env(os.environ) if args.wandb else dict(os.environ, PYTHONUNBUFFERED='1')
     env.pop('TQDM_DISABLE', None)
     env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT), env.get('PYTHONPATH')]))
-    n_stages = 10
+    n_stages = 4 + 2 * (len(slices) + 1)
     stage_i = 0
 
     def run(name, script, *options):
@@ -151,13 +217,10 @@ def main():
         print(shlex.join(cmd), flush=True)
         start = time.monotonic()
         log_path = out / f'{name}.log'
-        log_path.touch()
-        if wandb_run is not None:
-            save_live(log_path, out)
         with log_path.open('wb') as log:
             log.write((shlex.join(cmd) + '\n').encode())
             log.flush()
-            returncode = _tee_pty(cmd, log, ROOT, env)
+            returncode = _tee_pty(cmd, log, ROOT, env, emit=emit)
         elapsed = time.monotonic() - start
         metadata['stages'].append(dict(name=name, command=cmd, seconds=elapsed, returncode=returncode))
         if returncode:
@@ -165,13 +228,15 @@ def main():
         (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
         print(f'[{stage_i}/{n_stages} {100 * stage_i / n_stages:.0f}%] {name} finished in {elapsed:.1f}s', flush=True)
         if wandb_run is not None:
+            copy_into_run(wandb_run, log_path, relative=f'stage_logs/{log_path.name}')
+            copy_into_run(wandb_run, out / 'metadata.json')
             log_stage(wandb_run, name, elapsed, returncode, stage_i)
         if returncode:
             raise RuntimeError(f'{name} failed; see {out / (name + ".log")}')
 
     try:
         common = ['--model_path', model, '--dataset_path', data / 'redpajama-1t-sample',
-                  '--n_samples', 8, '--seq_len', 2048, '--effective_len', 8192]
+                  '--n_samples', n_samples, '--seq_len', 2048, '--effective_len', 8192]
         run('sensitivity', 'get_sensitivity.py', *common, '--save_path', out / 'sensitivity.pt')
         run('allocation', 'allocate_memory.py', '--sensitivity_path', out / 'sensitivity.pt',
             '--memory_budget', budget, '--fbit_choices', '4,2', '--hidden_size', kv_dim,
@@ -185,20 +250,25 @@ def main():
         assert all(b > 0 for b in budgets) and sum(budgets) <= budget + 1e-6
         assert all(torch.isfinite(s).all().item() and (s > 0).all().item() for s in scales)
         for method in ('original', 'pm-kvq'):
-            for index in (0, 15):
+            for name, eval_start, eval_end, output_path in _eval_jobs(method, slices, out):
                 options = ['--model_path', model, '--dataset_path', data / 'aime', '--benchmark', 'aime',
-                           '--version', 2025, '--start', index, '--end', index+1, '--n_responses', 1,
-                           '--method', method, '--output_path', out / method / f'{index}.json']
+                           '--version', 2025, '--start', eval_start, '--end', eval_end,
+                           '--n_responses', n_responses, '--seed', 42, '--method', method,
+                           '--output_path', output_path]
                 if method == 'pm-kvq':
-                    options += ['--backend', 'fake', '--rep_scales', out / 'scales.pt', '--kv_budgets', out / 'budgets.pt']
-                run(f'{method}_{index}', 'evaluation.py', *options)
+                    options += ['--backend', 'fake', '--rep_scales', out / 'scales.pt',
+                                '--kv_budgets', out / 'budgets.pt', '--n_sink_token', 1,
+                                '--n_sink_token_bits', 16, '--n_window_token', 128,
+                                '--n_window_token_bits', 16, '--n_init_kv_bits', 16]
+                run(name, 'evaluation.py', *options)
             run(f'{method}_judge', 'judge.py', '--benchmark', 'aime', '--version', 2025, '--responses_dir', out / method)
+        expected = _expected_keys(slices, n_responses)
         summary = {}
         for method in ('original', 'pm-kvq'):
             records = {}
-            for index in (0, 15):
-                records.update(json.loads((out / method / f'{index}.json').read_text()))
-            assert set(records) == {'aime_2025_I.1.0', 'aime_2025_II.1.0'}
+            for path in sorted((out / method).glob('*.json')):
+                records.update(json.loads(path.read_text()))
+            assert set(records) == expected, f'{method} coverage {len(records)}/{len(expected)}'
             summary[method] = {
                 'correct': sum(r['judgement'] for r in records.values()), 'responses': len(records),
                 'token_limit_hits': sum(r['hit_token_limit'] for r in records.values()),
@@ -210,9 +280,11 @@ def main():
         metadata['status'] = 'complete'
         (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
         if wandb_run is not None:
+            copy_into_run(wandb_run, out / 'summary.json')
+            copy_into_run(wandb_run, out / 'metadata.json')
             log_smoke_outputs(wandb_run, out, metadata, summary)
             wandb_run.finish(exit_code=0)
-        print(f'Completed smoke test: {out}', flush=True)
+        print(f'Completed {args.preset} run: {out}', flush=True)
         if wandb_run is not None:
             print(f'W&B: {wandb_run.url}', flush=True)
     except BaseException:
