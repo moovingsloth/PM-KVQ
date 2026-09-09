@@ -1,5 +1,6 @@
 torch==2.5.1
-transformers==4.51.0
+transformers==4.51.3
+tokenizers>=0.21,<0.22
 datasets==3.3.2
 accelerate==1.4.0
 cvxpy
