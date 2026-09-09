@@ -53,7 +53,19 @@ class PrintTokenStoppingCriteria(StoppingCriteria):
         return False
 
 
-def chat(model, tokenizer, text, print_response=False, return_len=False, **kwargs):
+def _generated_span(seq, prompt_len, eos_id):
+    gen = seq[prompt_len:]
+    if eos_id is None:
+        return gen
+    hits = (gen == eos_id).nonzero(as_tuple=False)
+    if hits.numel() == 0:
+        return gen
+    return gen[: int(hits[0, 0]) + 1]
+
+
+def chat(model, tokenizer, text, print_response=False, return_len=False, num_sequences=1, **kwargs):
+    if num_sequences < 1:
+        raise ValueError("num_sequences must be >= 1")
     stop_list = StoppingCriteriaList()
     if print_response:
         stop_list.append(PrintTokenStoppingCriteria(tokenizer))
@@ -63,7 +75,13 @@ def chat(model, tokenizer, text, print_response=False, return_len=False, **kwarg
             tokenize=False,
             add_generation_prompt=True,
         )
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if num_sequences == 1:
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    else:
+        tokenizer.padding_side = "left"
+        inputs = tokenizer([text] * num_sequences, return_tensors="pt", padding=True).to(model.device)
     inputs_len = inputs["input_ids"].shape[-1]
 
     generation_kwargs = deepcopy(DEFAULT_GENERATION_KWARGS)
@@ -72,25 +90,39 @@ def chat(model, tokenizer, text, print_response=False, return_len=False, **kwarg
     if not print_response:
         progress = TokenProgressCriteria(generation_kwargs.get("max_new_tokens", 8192))
         stop_list.append(progress)
+    generate_kwargs = dict(
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        stopping_criteria=stop_list,
+        **generation_kwargs,
+    )
+    if "attention_mask" in inputs:
+        generate_kwargs["attention_mask"] = inputs["attention_mask"]
     try:
-        outputs = model.generate(
-            inputs["input_ids"],
-            pad_token_id=tokenizer.eos_token_id,
-            stopping_criteria=stop_list,
-            **generation_kwargs,
-        )
+        outputs = model.generate(inputs["input_ids"], **generate_kwargs)
     finally:
         if progress is not None:
             progress.close()
-    decoded_text = tokenizer.decode(outputs[0][inputs_len:], skip_special_tokens=True)
-    if return_len:
-        outputs_len = len(outputs[0]) - inputs_len
+    eos_id = tokenizer.eos_token_id
+    if num_sequences == 1:
+        gen = _generated_span(outputs[0], inputs_len, eos_id)
+        decoded_text = tokenizer.decode(gen, skip_special_tokens=True)
+        outputs_len = int(gen.shape[0])
+        del inputs, outputs
+        torch.cuda.empty_cache()
+        if return_len:
+            return decoded_text, (inputs_len, outputs_len)
+        return decoded_text
+
+    results = []
+    for i in range(num_sequences):
+        gen = _generated_span(outputs[i], inputs_len, eos_id)
+        decoded_text = tokenizer.decode(gen, skip_special_tokens=True)
+        results.append((decoded_text, (inputs_len, int(gen.shape[0]))))
     del inputs, outputs
     torch.cuda.empty_cache()
     if return_len:
-        return decoded_text, (inputs_len, outputs_len)
-    else:
-        return decoded_text
+        return results
+    return [text for text, _ in results]
 
 
 def chatbot(model, tokenizer, **kwargs):

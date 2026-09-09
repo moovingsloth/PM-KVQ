@@ -19,7 +19,7 @@ parser.add_argument("--v_bits", type=int, default=-1)
 parser.add_argument("--save_path", type=str, default=None)
 args = parser.parse_args()
 
-model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="auto", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
 dataset = get_calib_redpajama(args.dataset_path, args.n_samples, args.seq_len, tokenizer)

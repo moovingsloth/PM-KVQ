@@ -16,6 +16,8 @@ parser.add_argument("--seed", type=int, help="Random seed for the first response
 parser.add_argument("--start", type=int, help="Start problem index", default=0)
 parser.add_argument("--end", type=int, help="End problem index", default=30)
 parser.add_argument("--n_responses", type=int, help="Number of responses per problem", default=16)
+parser.add_argument("--slices", type=str, default=None, help="Comma-separated half-open ranges, e.g. 0:5,15:20")
+parser.add_argument("--response_batch_size", type=int, default=None, help="Batch independent samples when the method has no per-sequence KV state")
 parser.add_argument("--method", type=str, help="Number of responses per problem", default="original", choices=["original", "pm-kvq", "rtn", "kivi", "rotatekv", "mikv"])
 args, unknown = parser.parse_known_args()
 
@@ -63,8 +65,12 @@ else:
 args = parser.parse_args()
 args_dict = vars(args)
 dataset_path = args_dict.pop("dataset_path")
-method_kwargs = {key: args_dict[key] for key in args_dict if key not in ["model_path", "output_path", "seed", "benchmark", "version", "start", "end", "n_responses", "method"]}
-evaluate_kwargs = {key: args_dict[key] for key in args_dict if key in ["output_path", "seed", "version", "start", "end", "n_responses"]}
+shared_keys = ["model_path", "output_path", "seed", "benchmark", "version", "start", "end", "n_responses", "method", "slices", "response_batch_size"]
+method_kwargs = {key: args_dict[key] for key in args_dict if key not in shared_keys}
+evaluate_keys = ["output_path", "seed", "version", "start", "end", "n_responses", "slices", "response_batch_size"]
+evaluate_kwargs = {key: args_dict[key] for key in args_dict if key in evaluate_keys}
+if evaluate_kwargs.get("slices"):
+    evaluate_kwargs["slices"] = [(int(left), int(right)) for part in evaluate_kwargs["slices"].split(",") for left, right in [part.split(":")]]
 generation_kwargs = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 32768, "do_sample": True}
 if dataset_path is not None:
     evaluate_kwargs["dataset_path"] = dataset_path

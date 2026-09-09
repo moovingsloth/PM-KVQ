@@ -13,7 +13,25 @@ from pm_kvq.utils.chatbot import chat
 DEFAULT_DATASET_PATH = "datasets/aime/"
 
 
-def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024, n_responses=1, record=True, output_path=None, start=None, end=None, seed=42, **kwargs):
+def _has_progressive_state(model):
+    if not (hasattr(model, "model") and hasattr(model.model, "layers")):
+        return False
+    return any(getattr(layer.self_attn, "n_bits", None) is not None for layer in model.model.layers)
+
+
+def _kv_bit_counts(model):
+    if not (hasattr(model, "model") and hasattr(model.model, "layers")):
+        return None
+    bit_counts = []
+    for layer in model.model.layers:
+        bits = getattr(layer.self_attn, "n_bits", None)
+        if bits is not None:
+            values, counts = bits[bits >= 0].unique(return_counts=True)
+            bit_counts.append({str(int(v)): int(c) for v, c in zip(values, counts)})
+    return bit_counts or None
+
+
+def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024, n_responses=1, record=True, output_path=None, start=None, end=None, seed=42, slices=None, response_batch_size=None, **kwargs):
     json_data = {}
     problems, answers, ids = [], [], []
     if output_path is not None:
@@ -31,42 +49,60 @@ def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024,
         subset_answers = pd.read_csv(answer_file)["answer"].tolist()
         answers += [str(answer) for answer in subset_answers]
     dataset = Dataset.from_dict({"problem": problems, "answer": answers, "id": ids})
-    if start is not None and end is not None:
+    if slices:
+        indices = [index for left, right in slices for index in range(left, right)]
+        dataset = dataset.select(indices)
+    elif start is not None and end is not None:
         dataset = dataset.select(range(start, end))
 
-    for problem_id, sample in enumerate(tqdm(dataset, desc="Evaluating", unit="problem", dynamic_ncols=True)):
+    # Progressive PM-KVQ bit state is per-layer, not per-sequence.
+    batch_size = 1 if _has_progressive_state(model) else min(n_responses, response_batch_size or 1)
+
+    def store(sample, index, response, length, elapsed, batched):
+        response_answer = math_postprocess(response)
+        judgement = judge(response_answer, sample["answer"])
+        if not record:
+            return
+        record_row = {
+            "seed": seed + index,
+            "response": response,
+            "response_answer": response_answer,
+            "gold": sample["answer"],
+            "judgement": judgement,
+            "input_len": length[0],
+            "output_len": length[1],
+            "elapsed_seconds": elapsed,
+            "hit_token_limit": length[1] >= kwargs.get("max_new_tokens", 8192),
+        }
+        if batched:
+            record_row["batched"] = True
+        bit_counts = _kv_bit_counts(model)
+        if bit_counts:
+            record_row["kv_bit_counts_by_layer"] = bit_counts
+        json_data[f"{sample['id']}.{index}"] = record_row
+        with open(output_path, "w") as f:
+            json.dump(json_data, f, indent=4)
+
+    for sample in tqdm(dataset, desc="Evaluating", unit="problem", dynamic_ncols=True):
         problem = sample["problem"]
         prompt = f"{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
-        for i in range(n_responses):
-            torch.manual_seed(seed + i)
+        if batch_size == 1:
+            for i in range(n_responses):
+                torch.manual_seed(seed + i)
+                started = time.monotonic()
+                response, length = chat(model, tokenizer, text=prompt, print_response=False, return_len=True, **kwargs)
+                store(sample, i, response, length, time.monotonic() - started, batched=False)
+            continue
+        for start_i in range(0, n_responses, batch_size):
+            n_batch = min(batch_size, n_responses - start_i)
+            torch.manual_seed(seed + start_i)
             started = time.monotonic()
-            response, length = chat(model, tokenizer, text=prompt, print_response=False, return_len=True, **kwargs)
+            results = chat(model, tokenizer, text=prompt, print_response=False, return_len=True, num_sequences=n_batch, **kwargs)
             elapsed = time.monotonic() - started
-            response_answer = math_postprocess(response)
-            judgement = judge(response_answer, sample["answer"])
-            if record:
-                json_data[f"{sample['id']}.{i}"] = {
-                    "seed": seed + i,
-                    "response": response,
-                    "response_answer": response_answer,
-                    "gold": sample["answer"],
-                    "judgement": judgement,
-                    "input_len": length[0],
-                    "output_len": length[1],
-                    "elapsed_seconds": elapsed,
-                    "hit_token_limit": length[1] >= kwargs.get("max_new_tokens", 8192),
-                }
-                if hasattr(model, "model") and hasattr(model.model, "layers"):
-                    bit_counts = []
-                    for layer in model.model.layers:
-                        bits = getattr(layer.self_attn, "n_bits", None)
-                        if bits is not None:
-                            values, counts = bits[bits >= 0].unique(return_counts=True)
-                            bit_counts.append({str(int(v)): int(c) for v, c in zip(values, counts)})
-                    if bit_counts:
-                        json_data[f"{sample['id']}.{i}"]["kv_bit_counts_by_layer"] = bit_counts
-                with open(output_path, "w") as f:
-                    json.dump(json_data, f, indent=4)
+            if n_batch == 1:
+                results = [results]
+            for offset, (response, length) in enumerate(results):
+                store(sample, start_i + offset, response, length, elapsed, batched=True)
     acc = calculate_acc(output_path)
     return acc
 

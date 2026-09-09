@@ -66,7 +66,9 @@ def search_rep_scales(model, k_config, v_config, dataset, max_keys, grid=20, bat
     loss_func = torch.nn.MSELoss()
 
     for n_layer, layer in enumerate(tqdm(layers, desc="Searching scales", unit="layer", dynamic_ncols=True)):
-        layer.cuda()
+        offload = next(layer.parameters()).device.type != "cuda"
+        if offload:
+            layer.cuda()
         quant_layer = deepcopy(layer)
         handle = layer.self_attn.register_forward_hook(partial(catch_attention_ouptut_hook, attention_outputs=attention_outputs, is_teacher=True, batch_size=batch_size))
         attention_outputs["batch"] = 0
@@ -121,9 +123,10 @@ def search_rep_scales(model, k_config, v_config, dataset, max_keys, grid=20, bat
         for i in range(n_samples // batch_size):
             input_hidden_states[i * batch_size : (i + 1) * batch_size] = layer(input_hidden_states[i * batch_size : (i + 1) * batch_size], position_embeddings=position_embeddings)[0]
 
-        layer.cpu()
         del quant_layer
-        torch.cuda.empty_cache()
+        if offload:
+            layer.cpu()
+            torch.cuda.empty_cache()
 
     if save_path is not None:
         torch.save(result_rep_scales, save_path)
