@@ -387,6 +387,61 @@ full run.
    --responses_dir /PATH/TO/MODEL/RESPONSES
    ```
 
+## Apply KIVI
+
+KIVI is a standalone baseline. It does not use PM-KVQ progressive mixed-precision, block-wise memory allocation, or positional-interpolation scales. Do not pass KIVI through `scripts/smoke_aime2025.py`; that runner only accepts `--methods original`, `pm-kvq`, and `thinkv`. Call `scripts/evaluation.py` directly. No calibration artifacts are required. Bit-width is uniform and set with `--k_bits` and `--v_bits` (paper Table 2 compares uniform 2-bit KIVI). This path is fake-quant: tensors stay BF16-sized, so the score is numerical accuracy, not packed KV memory.
+
+1. Evaluate the quantized model. Use `--start` and `--end` for the problem index range, and write response files for different problems into the same directory.
+
+   ```bash
+   python scripts/evaluation.py \
+   --model_path /PATH/TO/MODEL \
+   --output_path /PATH/TO/SAVE/MODEL/RESPONSES \
+   --benchmark aime \
+   --version 2024 \
+   --start 0 \
+   --end 30 \
+   --n_responses 16 \
+   --method kivi \
+   --k_bits 2 \
+   --v_bits 2
+   ```
+
+2. Judge the responses.
+
+   ```bash
+   python scripts/judge.py \
+   --benchmark aime \
+   --version 2024 \
+   --responses_dir /PATH/TO/MODEL/RESPONSES
+   ```
+
+Local R1-Qwen-14B on AIME2025 (same generation settings as the smoke runner: temperature 0.6, top-p 0.95, 32,768-token limit, seed 42). Smoke-sized subset is problem 1 of each contest (indices 0 and 15), one response each:
+
+```bash
+cd /home/dongwon/workspace/emil/pm-pkv
+conda activate pm_kvq
+python scripts/evaluation.py \
+  --model_path /home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B \
+  --dataset_path /home/dongwon/workspace/datasets/aime \
+  --output_path outputs/kivi/0.json \
+  --benchmark aime --version 2025 \
+  --start 0 --end 1 --n_responses 1 --seed 42 \
+  --method kivi --k_bits 2 --v_bits 2
+python scripts/evaluation.py \
+  --model_path /home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B \
+  --dataset_path /home/dongwon/workspace/datasets/aime \
+  --output_path outputs/kivi/15.json \
+  --benchmark aime --version 2025 \
+  --start 15 --end 16 --n_responses 1 --seed 42 \
+  --method kivi --k_bits 2 --v_bits 2
+python scripts/judge.py \
+  --benchmark aime --version 2025 \
+  --responses_dir outputs/kivi
+```
+
+Day/full coverage uses the same commands with the smoke runner ranges: day is indices 0–4 and 15–19 with 4 responses; full is `--start 0 --end 30 --n_responses 16`.
+
 ## Contact us
 
 - Tengxuan Liu: [liutx21@mails.tsinghua.edu.cn](mailto:liutx21@mails.tsinghua.edu.cn)
