@@ -1,8 +1,10 @@
 import copy
+import importlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -20,7 +22,7 @@ torch.set_num_threads(1)
 
 
 def artifact_for(model):
-    return dict(schema_version=1, model=model_identity(model.config, model.config._name_or_path),
+    return dict(schema_version=2, model=model_identity(model.config, model.config._name_or_path),
                 thresholds=[.3, .7], selected_layers=[0, 1, 2, 3], seed=42,
                 numerical=numerical_settings(ThinKVConfig()),
                 dataset=dict(path='/local/s1k', fingerprint='test-fixture', prompt_field='question',
@@ -35,9 +37,20 @@ class FormatsTests(unittest.TestCase):
         levels = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6.] * 2)
         torch.testing.assert_close(quantize_dequantize(levels, 4), levels)
         x = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5., 6.] * 2)
-        expected = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.] * 2)
+        expected = torch.tensor([0., 1., 1., 2., 2., 4., 4., 6.] * 2)
         torch.testing.assert_close(quantize_dequantize(x, 4), expected)
         torch.testing.assert_close(quantize_dequantize(-x, 4), -expected)
+
+    def test_fp4_either_side_of_every_midpoint(self):
+        midpoints = torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.])
+        lower = torch.tensor([0., .5, 1., 1.5, 2., 3., 4.])
+        upper = torch.tensor([.5, 1., 1.5, 2., 3., 4., 6.])
+        for sign in (1, -1):
+            for offset, expected in ((-.0001, lower), (.0001, upper)):
+                # Keep group maximum at 6, making the NVFP4 scale exactly one.
+                x = torch.cat([midpoints + offset, torch.tensor([6.])] * 2) * sign
+                target = torch.cat([expected, torch.tensor([6.])] * 2) * sign
+                torch.testing.assert_close(quantize_dequantize(x, 4), target)
 
     def test_ternary_zero_and_incomplete(self):
         x = torch.tensor([-1, -.6, -.4, 0, .4, .6, 1, 0.] * 2 + [.123])
@@ -70,9 +83,38 @@ class CalibrationTests(unittest.TestCase):
         config = ThinKVConfig()
         self.assertEqual([config.classify(s) for s in (0, .3, .7, 1)],
                          ['execution', 'reasoning', 'transition', 'transition'])
-        weights = torch.tensor([[[[1., .009, 0., 0.]], [[1., .01, .009, 0.]]]])
-        valid = torch.tensor([[[[True, True, True, False]]]])
-        self.assertAlmostEqual(attention_sparsity(weights, valid), .5)
+        scores = torch.tensor([[[[10., 0., 0., float('nan')]]]])
+        valid = torch.tensor([[True, True, True, False]])
+        self.assertAlmostEqual(attention_sparsity(scores, valid), 2 / 3)
+
+    def test_gqa_pooling_before_softmax_and_mha_mean_before_threshold(self):
+        scores = torch.tensor([[[[20., 0., 0.]], [[0., 10., 0.]]]])
+        # Opposing query heads: pooling logits preserves the larger peak.
+        self.assertAlmostEqual(attention_sparsity(scores, num_key_value_groups=2), 2 / 3)
+        # MHA averages probabilities first, retaining both heads' peaks.
+        self.assertAlmostEqual(attention_sparsity(scores), 1 / 3)
+        # Head offsets do not affect MHA softmax but must affect GQA logit pooling.
+        shifted = scores.clone()
+        shifted[:, 1] += 20
+        self.assertAlmostEqual(attention_sparsity(shifted, num_key_value_groups=2), 2 / 3)
+        self.assertAlmostEqual(attention_sparsity(shifted), 1 / 3)
+
+    def test_multiple_kv_groups_masks_and_empty_rows(self):
+        scores = torch.tensor([[[[20., 0., 0., 0.]], [[0., 10., 0., 0.]],
+                                [[0., 0., 10., 0.]], [[0., 0., 0., 10.]]]])
+        self.assertAlmostEqual(attention_sparsity(scores, num_key_value_groups=2), .25)
+        valid = torch.tensor([[True, False, True, True]])
+        self.assertEqual(attention_sparsity(scores, valid, 2), 0.)
+        for dtype in (torch.float32, torch.bfloat16):
+            uniform = torch.zeros(2, 4, 2, 4, dtype=dtype)
+            mask = torch.tensor([[True, False, False, False], [True, True, False, False]])
+            self.assertEqual(attention_sparsity(uniform, mask, 2), 0.)
+        with self.assertRaisesRegex(ValueError, 'empty valid row'):
+            attention_sparsity(scores, torch.zeros(1, 4, dtype=torch.bool), 2)
+        with self.assertRaisesRegex(ValueError, 'divisible'):
+            attention_sparsity(scores, num_key_value_groups=3)
+        with self.assertRaisesRegex(ValueError, 'finite'):
+            attention_sparsity(scores * float('nan'))
 
     def test_kde_three_modes_selection_and_failure(self):
         rng = np.random.default_rng(42)
@@ -96,6 +138,7 @@ class CalibrationTests(unittest.TestCase):
             path.write_text(json.dumps(data))
             loaded, config = load_calibration(path, data['model'])
             self.assertEqual(loaded, data)
+            self.assertEqual(loaded['schema_version'], 2)
             self.assertEqual(config.selected_layers, (0, 1, 2, 3))
             quantize_model(model, 'thinkv', {'thinkv_calibration': str(path)})
             self.assertEqual(model.thinkv_config.token_budget, 1024)
@@ -111,6 +154,8 @@ class CalibrationTests(unittest.TestCase):
             validate_calibration(invalid)
         with self.assertRaisesRegex(ValueError, 'identity'):
             validate_calibration(data, dict(data['model'], path='/different-model'))
+        with self.assertRaisesRegex(ValueError, 'recalibrate.*schema 2'):
+            validate_calibration(dict(data, schema_version=1))
 
 
 class CacheTests(unittest.TestCase):
@@ -296,6 +341,85 @@ class ModelTests(unittest.TestCase):
                     actual = model.model.layers[layer].self_attn(hidden, embedding, None,
                                                                 past_key_value=isolated, cache_position=position)[0]
                     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_cpu_bf16_default_refresh_270_token_generation(self):
+        for config_cls, model_cls in self.families:
+            with self.subTest(model=model_cls.__name__):
+                model = self.make_model(config_cls, model_cls).to(torch.bfloat16)
+                apply_thinkv(model, config=ThinKVConfig(token_budget=160))
+                ids = torch.tensor([[1, 7, 13, 9]])
+                output = model.generate(ids, max_new_tokens=270, do_sample=False, return_dict_in_generate=True)
+                diagnostics = model.thinkv_last_diagnostics
+                self.assertEqual(output.sequences.shape[-1], 274)
+                self.assertEqual(diagnostics['settings']['refresh_interval'], 128)
+                self.assertEqual(diagnostics['decoded_tokens_cached'], 269)
+                self.assertEqual(diagnostics['cache_dtypes'], ['torch.bfloat16'])
+                self.assertTrue(all(n > 0 for n in diagnostics['evicted_tokens_by_layer']))
+                self.assertTrue(all(sum(counts.values()) >= 256 for counts in diagnostics['quantized_token_counts_by_layer']))
+                self.assertTrue(all(n <= 160 for n in diagnostics['retained_tokens_by_layer']))
+                for positions, keys in zip(output.past_key_values.positions, output.past_key_values.key_cache):
+                    self.assertEqual(positions[:4].tolist(), [0, 1, 2, 3])
+                    self.assertEqual(positions[-1].item(), 272)
+                    self.assertTrue((positions[1:] > positions[:-1]).all())
+                    self.assertTrue(torch.isfinite(keys).all())
+
+    def test_calibration_and_inference_share_raw_score_statistics(self):
+        original = self.make_model(Qwen2Config, Qwen2ForCausalLM)
+        calibration, inference = copy.deepcopy(original), copy.deepcopy(original)
+        config = ThinKVConfig(quantization=False, eviction=False)
+        apply_thinkv(calibration, config=config, collect_traces=True)
+        apply_thinkv(inference, config=config)
+        ids = torch.tensor([[1, 3, 9]])
+        adapter = importlib.import_module('pm_kvq.quantization.methods.thinkv.apply_thinkv')
+        with patch.object(adapter, 'attention_sparsity', wraps=attention_sparsity) as statistic:
+            calibration.generate(ids, max_new_tokens=6, do_sample=False)
+            calibration_scores = [call.args[0].clone() for call in statistic.call_args_list]
+            self.assertEqual(statistic.call_count, 4 * 6)
+            self.assertTrue(all(call.args[2] == 2 for call in statistic.call_args_list))
+            statistic.reset_mock()
+            inference.generate(ids, max_new_tokens=6, do_sample=False)
+            self.assertEqual(statistic.call_count, len(calibration_scores))
+            for expected, call in zip(calibration_scores, statistic.call_args_list):
+                torch.testing.assert_close(call.args[0], expected)
+        for layer in range(4):
+            expected = [attention_sparsity(calibration_scores[step * 4 + layer], num_key_value_groups=2)
+                        for step in range(1, 6)]
+            self.assertEqual(calibration.thinkv_last_traces[layer], expected)
+        self.assertEqual(calibration.thinkv_last_diagnostics, inference.thinkv_last_diagnostics)
+
+    def test_diagnostics_and_traces_cleared_before_all_failed_entries(self):
+        model = self.make_model(Qwen2Config, Qwen2ForCausalLM)
+        apply_thinkv(model, config=ThinKVConfig(token_budget=8), collect_traces=True)
+        ids = torch.tensor([[1, 2]])
+        failures = [
+            (ValueError, lambda: model.generate(ids, num_beams=2)),
+            (TypeError, lambda: model.generate(ids, inputs=ids)),
+            (ValueError, lambda: model.generate(ids.expand(2, -1), max_new_tokens=2)),
+            (MemoryError, lambda: model.generate(ids, max_new_tokens=12, do_sample=False)),
+            (MemoryError, lambda: model.generate(ids.repeat(1, 5), max_new_tokens=2)),
+            (ValueError, lambda: model(ids, use_cache=False)),
+            (TypeError, lambda: model(ids, input_ids=ids)),
+            (ValueError, lambda: model(ids[:, :0])),
+            (MemoryError, lambda: model(ids.repeat(1, 5))),
+        ]
+        for error, fail in failures:
+            with self.subTest(error=error, fail=fail):
+                model.generate(ids, max_new_tokens=3, do_sample=False)
+                self.assertIsNotNone(model.thinkv_last_diagnostics)
+                self.assertTrue(model.thinkv_last_traces[0])
+                with self.assertRaises(error):
+                    fail()
+                self.assertIsNone(model.thinkv_last_diagnostics)
+                self.assertIsNone(model.thinkv_last_traces)
+        # A direct decode failure must also clear observations of earlier forwards.
+        output = model(ids)
+        for _ in range(6):
+            output = model(torch.tensor([[3]]), past_key_values=output.past_key_values)
+        self.assertTrue(model.thinkv_last_traces[0])
+        with self.assertRaises(MemoryError):
+            model(torch.tensor([[3]]), past_key_values=output.past_key_values)
+        self.assertIsNone(model.thinkv_last_diagnostics)
+        self.assertIsNone(model.thinkv_last_traces)
 
     def test_reject_unsupported_and_use_previous_completed_forward(self):
         model = self.make_model(Qwen2Config, Qwen2ForCausalLM)

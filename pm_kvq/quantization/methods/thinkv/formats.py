@@ -34,8 +34,14 @@ def quantize_dequantize(x, bits, group_size=16, axis=-1):
     levels = [0., .5, 1., 1.5, 2., 3., 4., 6.] if bits == 4 else [0., 1.]
     levels = torch.tensor(levels, device=x.device)
     normalized = groups.abs() / safe
-    # Nearest level; exact midpoints choose the smaller magnitude.
-    indices = torch.bucketize(normalized.contiguous(), (levels[1:] + levels[:-1]) / 2)
+    midpoints = (levels[1:] + levels[:-1]) / 2
+    indices = torch.bucketize(normalized.contiguous(), midpoints)
+    if bits == 4:
+        # E2M1's ordered magnitude encodings have even LSBs at even indices.
+        # bucketize chooses the lower neighbor; promote odd encodings at ties.
+        at_midpoint = normalized == midpoints[indices.clamp(max=len(midpoints) - 1)]
+        indices = indices + (at_midpoint & (indices % 2 == 1)).long()
+    # Ternary keeps its existing midpoint-to-zero convention.
     decoded = groups.sign() * levels[indices] * scales
     result[..., :n] = decoded.reshape(*moved.shape[:-1], n).to(x.dtype)
     return result.movedim(-1, axis)

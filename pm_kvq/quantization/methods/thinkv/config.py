@@ -71,7 +71,10 @@ def validate_calibration(data, identity=None):
                 "thresholds", "selected_layers", "kde", "diagnostics", "versions"}
     if not isinstance(data, dict) or set(data) != required:
         raise ValueError(f"calibration keys must be exactly {sorted(required)}")
-    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+    if type(data["schema_version"]) is int and data["schema_version"] == 1:
+        raise ValueError("ThinKV schema 1 uses obsolete sparsity statistics; recalibrate with "
+                         "scripts/calibrate_thinkv.py to create schema 2 (do not relabel the version)")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 2:
         raise ValueError("unsupported ThinKV calibration schema")
     numerical = data["numerical"]
     expected = {"group_size", "reasoning_bits", "execution_bits", "transition_bits", "refresh_interval"}
