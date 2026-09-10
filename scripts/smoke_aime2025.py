@@ -1,4 +1,4 @@
-"""Run the R1-Qwen-14B BF16/PM-KVQ smoke pipeline using the active Conda Python."""
+"""Run the R1-Qwen-14B BF16/PM-KVQ pipeline, with opt-in ThinKV, using the active Conda Python."""
 import argparse
 import codecs
 import datetime
@@ -118,7 +118,7 @@ def _tee_pty(cmd, log, cwd, env, emit=emit_console):
     return proc.wait()
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preset', choices=sorted(PRESETS), default='smoke',
                         help='smoke: 8 calib samples, AIME I.1 and II.1, 1 response. '
@@ -127,6 +127,14 @@ def main():
     parser.add_argument('--model_path', default='/home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B')
     parser.add_argument('--dataset_root', default='/home/dongwon/workspace/datasets')
     parser.add_argument('--output_dir', default=None)
+    parser.add_argument('--methods', nargs='+', choices=['original', 'pm-kvq', 'thinkv'],
+                        default=['original', 'pm-kvq'], help='Opt-in method selection; existing pair is the default')
+    parser.add_argument('--thinkv_calibration', default=None)
+    parser.add_argument('--thinkv_token_budget', type=int, default=1024)
+    parser.add_argument('--thinkv_refresh_interval', type=int, default=None)
+    parser.add_argument('--thinkv_reasoning_bits', type=int, choices=[4, 8], default=None)
+    parser.add_argument('--thinkv_execution_bits', type=int, choices=[4], default=None)
+    parser.add_argument('--thinkv_transition_bits', type=int, choices=[2], default=None)
     parser.add_argument('--wandb', dest='wandb', action='store_true', default=True,
                         help=f'Log this run to {PROJECT_URL} (default)')
     parser.add_argument('--no-wandb', dest='wandb', action='store_false',
@@ -136,7 +144,42 @@ def main():
     parser.add_argument('--wandb_name', default=os.environ.get('WANDB_NAME'))
     parser.add_argument('--log_existing', default=None,
                         help='Publish an already-finished output directory to W&B without rerunning')
+    return parser
+
+
+def _method_options(method, args, out):
+    if method == 'pm-kvq':
+        return ['--backend', 'fake', '--rep_scales', out / 'scales.pt',
+                '--kv_budgets', out / 'budgets.pt', '--n_sink_token', 1,
+                '--n_sink_token_bits', 16, '--n_window_token', 128,
+                '--n_window_token_bits', 16, '--n_init_kv_bits', 16]
+    if method == 'thinkv':
+        options = ['--thinkv_calibration', out / 'thinkv_calibration.json',
+                   '--thinkv_token_budget', args.thinkv_token_budget]
+        for name in ('refresh_interval', 'reasoning_bits', 'execution_bits', 'transition_bits'):
+            value = getattr(args, f'thinkv_{name}')
+            if value is not None:
+                options += [f'--thinkv_{name}', value]
+        return options
+    return []
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    if len(set(args.methods)) != len(args.methods):
+        parser.error('--methods must not contain duplicates')
+    thinkv_artifact = None
+    if 'thinkv' in args.methods and not args.log_existing:
+        if args.thinkv_calibration is None:
+            parser.error('--methods thinkv requires --thinkv_calibration')
+        from dataclasses import replace
+        from pm_kvq.quantization.methods.thinkv.config import load_calibration, numerical_settings
+        thinkv_artifact, thinkv_config = load_calibration(args.thinkv_calibration)
+        overrides = {name: getattr(args, f'thinkv_{name}') for name in
+                     ('refresh_interval', 'reasoning_bits', 'execution_bits', 'transition_bits')
+                     if getattr(args, f'thinkv_{name}') is not None}
+        thinkv_config = replace(thinkv_config, token_budget=args.thinkv_token_budget, **overrides)
     stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     if args.output_dir is None:
         args.output_dir = str(ROOT / 'outputs' / args.preset / stamp)
@@ -160,6 +203,10 @@ def main():
     model = Path(args.model_path).resolve()
     data = Path(args.dataset_root).resolve()
     config = json.loads((model / 'config.json').read_text())
+    if thinkv_artifact is not None:
+        from pm_kvq.quantization.methods.thinkv.config import model_identity, validate_calibration
+        validate_calibration(thinkv_artifact, model_identity(
+            transformers.AutoConfig.from_pretrained(str(model), local_files_only=True), str(model)))
     assert config['model_type'] == 'qwen2' and config['num_hidden_layers'] == 48
     index = json.loads((model / 'model.safetensors.index.json').read_text())
     for shard in set(index['weight_map'].values()):
@@ -168,6 +215,8 @@ def main():
         assert (data / 'aime' / f'aime_2025_{subset}' / 'problems' / '1.tex').is_file()
     out = Path(args.output_dir).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    if thinkv_artifact is not None:
+        (out / 'thinkv_calibration.json').write_text(json.dumps(thinkv_artifact, indent=2, allow_nan=False))
     kv_dim = config['num_key_value_heads'] * config['hidden_size'] // config['num_attention_heads']
     # Paper Qwen-14B mixed 2/4 row on A100-40G: 2-bit@32k * (BS16/BS12) = 1024 MiB/request.
     # GB10 leftover ~94 GiB does not change this per-request budget.
@@ -185,6 +234,12 @@ def main():
                     seed=42, max_new_tokens=32768, temperature=0.6, top_p=0.95,
                     backend='fake', status='running', stages=[])
     metadata['git_revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    metadata['methods'] = args.methods
+    if 'pm-kvq' not in args.methods:
+        metadata.update(calibration_samples=0, memory_budget_mb=None, backend=None)
+    if thinkv_artifact is not None:
+        metadata['thinkv'] = dict(calibration=thinkv_artifact, token_budget=args.thinkv_token_budget,
+                                  numerical=numerical_settings(thinkv_config), storage='input_dtype_qdq_reference')
     model_metadata = model / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
     if model_metadata.is_file():
         metadata['model_revision'] = model_metadata.read_text().splitlines()[0]
@@ -206,7 +261,7 @@ def main():
     env = child_env(os.environ) if args.wandb else dict(os.environ, PYTHONUNBUFFERED='1')
     env.pop('TQDM_DISABLE', None)
     env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT), env.get('PYTHONPATH')]))
-    n_stages = 4 + 2 * (len(slices) + 1)
+    n_stages = (4 if 'pm-kvq' in args.methods else 0) + len(args.methods) * (len(slices) + 1)
     stage_i = 0
 
     def run(name, script, *options):
@@ -235,36 +290,33 @@ def main():
             raise RuntimeError(f'{name} failed; see {out / (name + ".log")}')
 
     try:
-        common = ['--model_path', model, '--dataset_path', data / 'redpajama-1t-sample',
-                  '--n_samples', n_samples, '--seq_len', 2048, '--effective_len', 8192]
-        run('sensitivity', 'get_sensitivity.py', *common, '--save_path', out / 'sensitivity.pt')
-        run('allocation', 'allocate_memory.py', '--sensitivity_path', out / 'sensitivity.pt',
-            '--memory_budget', budget, '--fbit_choices', '4,2', '--hidden_size', kv_dim,
-            '--max_len', 32768, '--save_path', out / 'budgets.pt')
-        run('max_keys', 'get_max_keys.py', *common, '--save_path', out / 'max_keys.pt')
-        run('scales', 'search_rep_scales.py', *common, '--max_keys_path', out / 'max_keys.pt',
-            '--k_bits', 2, '--v_bits', 2, '--save_path', out / 'scales.pt')
-        budgets = torch.load(out / 'budgets.pt', map_location='cpu')
-        scales = torch.load(out / 'scales.pt', map_location='cpu')
-        assert len(budgets) == len(scales) == config['num_hidden_layers']
-        assert all(b > 0 for b in budgets) and sum(budgets) <= budget + 1e-6
-        assert all(torch.isfinite(s).all().item() and (s > 0).all().item() for s in scales)
-        for method in ('original', 'pm-kvq'):
+        if 'pm-kvq' in args.methods:
+            common = ['--model_path', model, '--dataset_path', data / 'redpajama-1t-sample',
+                      '--n_samples', n_samples, '--seq_len', 2048, '--effective_len', 8192]
+            run('sensitivity', 'get_sensitivity.py', *common, '--save_path', out / 'sensitivity.pt')
+            run('allocation', 'allocate_memory.py', '--sensitivity_path', out / 'sensitivity.pt',
+                '--memory_budget', budget, '--fbit_choices', '4,2', '--hidden_size', kv_dim,
+                '--max_len', 32768, '--save_path', out / 'budgets.pt')
+            run('max_keys', 'get_max_keys.py', *common, '--save_path', out / 'max_keys.pt')
+            run('scales', 'search_rep_scales.py', *common, '--max_keys_path', out / 'max_keys.pt',
+                '--k_bits', 2, '--v_bits', 2, '--save_path', out / 'scales.pt')
+            budgets = torch.load(out / 'budgets.pt', map_location='cpu')
+            scales = torch.load(out / 'scales.pt', map_location='cpu')
+            assert len(budgets) == len(scales) == config['num_hidden_layers']
+            assert all(b > 0 for b in budgets) and sum(budgets) <= budget + 1e-6
+            assert all(torch.isfinite(s).all().item() and (s > 0).all().item() for s in scales)
+        for method in args.methods:
             for name, eval_start, eval_end, output_path in _eval_jobs(method, slices, out):
                 options = ['--model_path', model, '--dataset_path', data / 'aime', '--benchmark', 'aime',
                            '--version', 2025, '--start', eval_start, '--end', eval_end,
                            '--n_responses', n_responses, '--seed', 42, '--method', method,
                            '--output_path', output_path]
-                if method == 'pm-kvq':
-                    options += ['--backend', 'fake', '--rep_scales', out / 'scales.pt',
-                                '--kv_budgets', out / 'budgets.pt', '--n_sink_token', 1,
-                                '--n_sink_token_bits', 16, '--n_window_token', 128,
-                                '--n_window_token_bits', 16, '--n_init_kv_bits', 16]
+                options += _method_options(method, args, out)
                 run(name, 'evaluation.py', *options)
             run(f'{method}_judge', 'judge.py', '--benchmark', 'aime', '--version', 2025, '--responses_dir', out / method)
         expected = _expected_keys(slices, n_responses)
         summary = {}
-        for method in ('original', 'pm-kvq'):
+        for method in args.methods:
             records = {}
             for path in sorted((out / method).glob('*.json')):
                 records.update(json.loads(path.read_text()))
@@ -276,6 +328,13 @@ def main():
                 'quantization_observed': any(int(bit) < 16 and count > 0 for r in records.values()
                     for layer in r.get('kv_bit_counts_by_layer', []) for bit, count in layer.items()),
             }
+            if method == 'thinkv':
+                summary[method]['quantization_observed'] = any(
+                    count > 0 for r in records.values()
+                    for layer in r['thinkv']['quantized_token_counts_by_layer'] for count in layer.values())
+                summary[method]['eviction_observed'] = any(
+                    count > 0 for r in records.values() for count in r['thinkv']['evicted_tokens_by_layer'])
+                summary[method]['cache_tensor_bytes'] = {key: r['thinkv']['cache_tensor_bytes'] for key, r in records.items()}
         (out / 'summary.json').write_text(json.dumps(summary, indent=2))
         metadata['status'] = 'complete'
         (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))

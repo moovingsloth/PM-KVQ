@@ -2,6 +2,11 @@ def quantize_model(model, method, method_kwargs):
     if method == "original":
         return
 
+    elif method == "thinkv":
+        from pm_kvq.quantization.methods.thinkv import apply_thinkv
+
+        apply_thinkv(model, **method_kwargs)
+
     elif method == "kivi":
         from pm_kvq.quantization.methods.kivi.apply_kivi import apply_kivi
 

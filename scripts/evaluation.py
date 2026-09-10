@@ -16,10 +16,20 @@ parser.add_argument("--seed", type=int, help="Random seed for the first response
 parser.add_argument("--start", type=int, help="Start problem index", default=0)
 parser.add_argument("--end", type=int, help="End problem index", default=30)
 parser.add_argument("--n_responses", type=int, help="Number of responses per problem", default=16)
-parser.add_argument("--method", type=str, help="Number of responses per problem", default="original", choices=["original", "pm-kvq", "rtn", "kivi", "rotatekv", "mikv"])
+parser.add_argument("--method", type=str, help="KV cache method", default="original", choices=["original", "pm-kvq", "rtn", "kivi", "rotatekv", "mikv", "thinkv"])
+# Register before the first parse so --method thinkv --help includes its options.
+parser.add_argument("--thinkv_calibration", help="Validated ThinKV calibration JSON")
+parser.add_argument("--thinkv_token_budget", type=int, default=1024)
+parser.add_argument("--thinkv_refresh_interval", type=int, default=None)
+parser.add_argument("--thinkv_reasoning_bits", type=int, choices=[4, 8], default=None)
+parser.add_argument("--thinkv_execution_bits", type=int, choices=[4], default=None)
+parser.add_argument("--thinkv_transition_bits", type=int, choices=[2], default=None)
 args, unknown = parser.parse_known_args()
 
 if args.method == "original":
+    pass
+
+elif args.method == "thinkv":
     pass
 
 elif args.method == "pm-kvq":
@@ -61,7 +71,11 @@ else:
     raise NotImplementedError
 
 args = parser.parse_args()
+if args.method == "thinkv" and not args.thinkv_calibration:
+    parser.error("--method thinkv requires --thinkv_calibration")
 args_dict = vars(args)
+if args.method != "thinkv":
+    args_dict = {key: value for key, value in args_dict.items() if not key.startswith("thinkv_")}
 dataset_path = args_dict.pop("dataset_path")
 method_kwargs = {key: args_dict[key] for key in args_dict if key not in ["model_path", "output_path", "seed", "benchmark", "version", "start", "end", "n_responses", "method"]}
 evaluate_kwargs = {key: args_dict[key] for key in args_dict if key in ["output_path", "seed", "version", "start", "end", "n_responses"]}
