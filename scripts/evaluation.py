@@ -9,6 +9,7 @@ from pm_kvq.evaluation.eval_wrapper import evaluate_model
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", type=str, help="Path to the model")
 parser.add_argument("--dataset_path", type=str, default=None, help="Local benchmark dataset directory")
+parser.add_argument("--aime_manifest", default=None, help="Ordered AIME selection JSON; overrides version/start/end")
 parser.add_argument("--output_path", type=str, help="Path to the output .jsonl file")
 parser.add_argument("--benchmark", type=str, help="Benchmark name", default="aime", choices=["aime", "cmimc", "livecodebench"])
 parser.add_argument("--version", type=str, help="Benchmark version", default="2024")
@@ -73,15 +74,27 @@ else:
 args = parser.parse_args()
 if args.method == "thinkv" and not args.thinkv_calibration:
     parser.error("--method thinkv requires --thinkv_calibration")
+if args.n_responses <= 0:
+    parser.error("--n_responses must be positive")
+if args.aime_manifest is not None:
+    if args.benchmark != "aime":
+        parser.error("--aime_manifest requires --benchmark aime")
+    from pm_kvq.evaluation.aime_manifest import load_manifest, load_problems
+    from pm_kvq.evaluation.eval_aime import DEFAULT_DATASET_PATH
+    # Fail on missing selected data before from_pretrained can initialize a GPU.
+    load_problems(args.dataset_path or DEFAULT_DATASET_PATH, load_manifest(args.aime_manifest))
 args_dict = vars(args)
 if args.method != "thinkv":
     args_dict = {key: value for key, value in args_dict.items() if not key.startswith("thinkv_")}
 dataset_path = args_dict.pop("dataset_path")
+aime_manifest = args_dict.pop("aime_manifest")
 method_kwargs = {key: args_dict[key] for key in args_dict if key not in ["model_path", "output_path", "seed", "benchmark", "version", "start", "end", "n_responses", "method"]}
 evaluate_kwargs = {key: args_dict[key] for key in args_dict if key in ["output_path", "seed", "version", "start", "end", "n_responses"]}
 generation_kwargs = {"temperature": 0.6, "top_p": 0.95, "max_new_tokens": 32768, "do_sample": True}
 if dataset_path is not None:
     evaluate_kwargs["dataset_path"] = dataset_path
+if aime_manifest is not None:
+    evaluate_kwargs["aime_manifest"] = aime_manifest
 
 model = AutoModelForCausalLM.from_pretrained(args.model_path, device_map="auto", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)

@@ -25,6 +25,7 @@ CONFIG_KEYS = (
     "preset",
     "model_path",
     "dataset_root",
+    "aime",
     "torch",
     "transformers",
     "gpu",
@@ -63,6 +64,8 @@ ARTIFACT_FILES = (
     "scales.pt",
     "max_keys.pt",
     "thinkv_calibration.json",
+    "aime_manifest.json",
+    "coverage.json",
 )
 
 
