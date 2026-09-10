@@ -39,6 +39,8 @@ CONFIG_KEYS = (
     "temperature",
     "top_p",
     "backend",
+    "methods",
+    "thinkv",
     "git_revision",
     "model_revision",
     "status",
@@ -60,6 +62,7 @@ ARTIFACT_FILES = (
     "sensitivity.pt",
     "scales.pt",
     "max_keys.pt",
+    "thinkv_calibration.json",
 )
 
 
@@ -595,6 +598,12 @@ def log_eval_records(run, method: str, records: Mapping[str, Any]) -> None:
             problem_bits = sum(layer_bits) / len(layer_bits)
             metrics[f"eval/{method}/problem_mean_kv_bits"] = problem_bits
             mean_kv_bits.append(problem_bits)
+        thinkv = record.get("thinkv")
+        if thinkv:
+            for key in ("cache_tensor_bytes", "metadata_tensor_bytes", "decoded_tokens_cached"):
+                metrics[f"eval/{method}/{key}"] = thinkv[key]
+            metrics[f"eval/{method}/evicted_tokens_per_layer"] = sum(thinkv["evicted_tokens_by_layer"]) / len(thinkv["evicted_tokens_by_layer"])
+            metrics[f"eval/{method}/retained_tokens_per_layer"] = sum(thinkv["retained_tokens_by_layer"]) / len(thinkv["retained_tokens_by_layer"])
         run.log(metrics)
     if mean_kv_bits:
         run.summary[f"eval/{method}/mean_kv_bits"] = sum(mean_kv_bits) / len(mean_kv_bits)
@@ -610,7 +619,7 @@ def log_artifacts(run, output_dir: Path) -> None:
         if path.is_file():
             artifact.add_file(str(path), name=name)
             added = True
-    for method in ("original", "pm-kvq"):
+    for method in ("original", "pm-kvq", "thinkv"):
         method_dir = output_dir / method
         if not method_dir.is_dir():
             continue
@@ -650,7 +659,7 @@ def log_smoke_outputs(run, output_dir: Path, metadata: Mapping[str, Any] | None 
     if isinstance(sensitivity, dict):
         log_sensitivity(run, sensitivity)
         log_paper_figures(run, sensitivity, budgets, metadata=metadata or {})
-    for method in ("original", "pm-kvq"):
+    for method in ("original", "pm-kvq", "thinkv"):
         records = {}
         method_dir = output_dir / method
         if method_dir.is_dir():

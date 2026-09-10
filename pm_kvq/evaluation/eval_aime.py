@@ -56,6 +56,9 @@ def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024,
                     "elapsed_seconds": elapsed,
                     "hit_token_limit": length[1] >= kwargs.get("max_new_tokens", 8192),
                 }
+                thinkv_diagnostics = getattr(model, "thinkv_last_diagnostics", None)
+                if thinkv_diagnostics is not None:
+                    json_data[f"{sample['id']}.{i}"]["thinkv"] = thinkv_diagnostics
                 if hasattr(model, "model") and hasattr(model.model, "layers"):
                     bit_counts = []
                     for layer in model.model.layers:
