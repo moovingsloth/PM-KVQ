@@ -48,7 +48,7 @@ def search_rep_scales(model, k_config, v_config, dataset, max_keys, grid=20, bat
         position_ids = None
     handle = layers[0].register_forward_pre_hook(partial(catch_feature_hook, hidden_states=hidden_states, position_embeddings=position_embeddings), with_kwargs=True)
     with torch.no_grad():
-        for example in tqdm(dataset, desc="Generating Features"):
+        for example in tqdm(dataset, desc="Generating features", unit="sample", dynamic_ncols=True):
             try:
                 model(torch.tensor([example["input_ids"]], device=model.device), position_ids=position_ids)
             except ValueError:
@@ -65,7 +65,7 @@ def search_rep_scales(model, k_config, v_config, dataset, max_keys, grid=20, bat
     result_alpha = []
     loss_func = torch.nn.MSELoss()
 
-    for n_layer, layer in enumerate(tqdm(layers)):
+    for n_layer, layer in enumerate(tqdm(layers, desc="Searching scales", unit="layer", dynamic_ncols=True)):
         layer.cuda()
         quant_layer = deepcopy(layer)
         handle = layer.self_attn.register_forward_hook(partial(catch_attention_ouptut_hook, attention_outputs=attention_outputs, is_teacher=True, batch_size=batch_size))
@@ -88,7 +88,7 @@ def search_rep_scales(model, k_config, v_config, dataset, max_keys, grid=20, bat
         best_rep_scales = None
         best_alpha = None
 
-        for n in range(grid):
+        for n in tqdm(range(grid), desc=f"Layer {n_layer} scale grid", unit="pt", leave=False, dynamic_ncols=True):
             loss_all.append(0)
             rep_scales = (max_keys[n_layer].to(next(layer.parameters()).device, next(layer.parameters()).dtype) ** (1 - n / grid)).clamp(min=1e-4, max=1e4)
             key_scales = rep_scales.repeat(1, 1, 1, 2)

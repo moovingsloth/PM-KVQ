@@ -19,7 +19,7 @@ def apply_fake_pmkvq(
     n_window_token_bits,
     n_init_kv_bits,
 ):
-    apply_smoothattention_rep(model, rep_scales)
+    apply_smoothattention_rep(model, rep_scales=rep_scales)
     apply_progressive(model, kv_budgets, n_sink_token, n_sink_token_bits, n_window_token, n_window_token_bits, n_init_kv_bits)
 
 
@@ -33,7 +33,7 @@ def apply_real_pmkvq(
     n_window_token_bits,
     n_init_kv_bits,
 ):
-    apply_smoothattention_rep(model, rep_scales)
+    apply_smoothattention_rep(model, rep_scales=rep_scales)
     if isinstance(kv_budgets, str):
         kv_budgets = torch.load(kv_budgets)
     if isinstance(kv_budgets, float):

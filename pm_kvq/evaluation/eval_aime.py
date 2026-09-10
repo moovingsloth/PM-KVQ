@@ -1,6 +1,7 @@
 import re
 import os
 import json
+import time
 from tqdm import tqdm
 import pandas as pd
 
@@ -33,12 +34,14 @@ def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024,
     if start is not None and end is not None:
         dataset = dataset.select(range(start, end))
 
-    for problem_id, sample in enumerate(tqdm(dataset)):
+    for problem_id, sample in enumerate(tqdm(dataset, desc="Evaluating", unit="problem", dynamic_ncols=True)):
         problem = sample["problem"]
         prompt = f"{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
         for i in range(n_responses):
             torch.manual_seed(seed + i)
+            started = time.monotonic()
             response, length = chat(model, tokenizer, text=prompt, print_response=False, return_len=True, **kwargs)
+            elapsed = time.monotonic() - started
             response_answer = math_postprocess(response)
             judgement = judge(response_answer, sample["answer"])
             if record:
@@ -50,7 +53,18 @@ def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024,
                     "judgement": judgement,
                     "input_len": length[0],
                     "output_len": length[1],
+                    "elapsed_seconds": elapsed,
+                    "hit_token_limit": length[1] >= kwargs.get("max_new_tokens", 8192),
                 }
+                if hasattr(model, "model") and hasattr(model.model, "layers"):
+                    bit_counts = []
+                    for layer in model.model.layers:
+                        bits = getattr(layer.self_attn, "n_bits", None)
+                        if bits is not None:
+                            values, counts = bits[bits >= 0].unique(return_counts=True)
+                            bit_counts.append({str(int(v)): int(c) for v, c in zip(values, counts)})
+                    if bit_counts:
+                        json_data[f"{sample['id']}.{i}"]["kv_bit_counts_by_layer"] = bit_counts
                 with open(output_path, "w") as f:
                     json.dump(json_data, f, indent=4)
     acc = calculate_acc(output_path)

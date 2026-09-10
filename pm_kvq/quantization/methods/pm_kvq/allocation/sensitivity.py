@@ -78,7 +78,7 @@ def get_kv_sensitivity(model, calib_dataset, effective_len=None, save_path=None)
         param.requires_grad = False
     layers[0].input_layernorm.weight.requires_grad = True
 
-    for example in tqdm(calib_dataset, desc="Profiling sensitivity", unit="sample"):
+    for example in tqdm(calib_dataset, desc="Profiling sensitivity", unit="sample", dynamic_ncols=True):
         loss = model(torch.tensor([example["input_ids"]], device=model.device), labels=torch.tensor([example["input_ids"]], device=model.device), position_ids=position_ids, use_cache=False).loss
         loss.backward()
 
