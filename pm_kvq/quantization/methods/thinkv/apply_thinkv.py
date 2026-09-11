@@ -43,10 +43,12 @@ def thinkv_attention(self, hidden_states, position_embeddings, attention_mask,
     weights = None
     if not cache.is_prefill or self.layer_idx in cache.config.selected_layers:
         scores = (statistic_query @ key.transpose(-2, -1)) * self.scaling
-        scores = scores.masked_fill(~statistic_valid, torch.finfo(scores.dtype).min)
-        weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        if not cache.is_prefill:
+            masked_scores = scores.masked_fill(~statistic_valid, torch.finfo(scores.dtype).min)
+            weights = F.softmax(masked_scores, dim=-1, dtype=torch.float32).to(query.dtype)
     if self.layer_idx in cache.config.selected_layers:
-        cache.step_sparsities[self.layer_idx] = attention_sparsity(weights, statistic_valid)
+        cache.step_sparsities[self.layer_idx] = attention_sparsity(
+            scores, statistic_valid, self.num_key_value_groups)
     if not cache.is_prefill:
         output = weights @ value
     output = output.transpose(1, 2).contiguous().reshape(*hidden_states.shape[:-1], -1)
@@ -88,6 +90,7 @@ def apply_thinkv(model, thinkv_calibration=None, thinkv_token_budget=1024,
         raise ValueError("ThinKV selected layer exceeds model layer count")
     model.thinkv_config = config
     model.thinkv_last_diagnostics = None
+    model.thinkv_last_traces = None
     model.config._attn_implementation = "eager"
     original_forward = model.forward
     forward_signature = inspect.signature(original_forward)
@@ -96,9 +99,10 @@ def apply_thinkv(model, thinkv_calibration=None, thinkv_token_budget=1024,
 
     @wraps(original_forward)
     def forward(*args, **kwargs):
+        model.thinkv_last_diagnostics = None
+        model.thinkv_last_traces = None
         bound = forward_signature.bind(*args, **kwargs)
         values = bound.arguments
-        model.thinkv_last_diagnostics = None
         if model.training or values.get("labels") is not None:
             raise ValueError("ThinKV reference supports inference with model.eval() only")
         if values.get("use_cache", model.config.use_cache) is False:
@@ -134,10 +138,14 @@ def apply_thinkv(model, thinkv_calibration=None, thinkv_token_budget=1024,
             raise
         model.thinkv_last_diagnostics = cache.diagnostics()
         model.thinkv_last_diagnostics["settings"] = dict(numerical_settings(config), token_budget=config.token_budget)
+        if collect_traces:
+            model.thinkv_last_traces = cache.traces
         return output
 
     @wraps(original_generate)
     def generate(*args, **kwargs):
+        model.thinkv_last_diagnostics = None
+        model.thinkv_last_traces = None
         bound = generate_signature.bind(*args, **kwargs)
         values = bound.arguments
         extra = values.setdefault("kwargs", {})
@@ -154,15 +162,15 @@ def apply_thinkv(model, thinkv_calibration=None, thinkv_token_budget=1024,
             raise ValueError("ThinKV generate starts a fresh request; external caches are unsupported")
         cache = ThinKVCache(config, len(layers), collect_traces)
         extra["past_key_values"] = cache
-        model.thinkv_last_diagnostics = None
         try:
             output = original_generate(*bound.args, **bound.kwargs)
+            sequences = output.sequences if hasattr(output, "sequences") else output
+            model.thinkv_last_diagnostics["generated_sequence_length"] = sequences.shape[-1]
+            model.thinkv_last_diagnostics["output_tokens"] = sequences.shape[-1] - cache.prompt_length
         except BaseException:
             model.thinkv_last_diagnostics = None
+            model.thinkv_last_traces = None
             raise
-        sequences = output.sequences if hasattr(output, "sequences") else output
-        model.thinkv_last_diagnostics["generated_sequence_length"] = sequences.shape[-1]
-        model.thinkv_last_diagnostics["output_tokens"] = sequences.shape[-1] - cache.prompt_length
         if collect_traces:
             model.thinkv_last_traces = cache.traces
         return output

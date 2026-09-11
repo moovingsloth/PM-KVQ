@@ -9,30 +9,35 @@ import torch
 from datasets import Dataset
 
 from pm_kvq.utils.chatbot import chat
+from pm_kvq.evaluation.aime_manifest import load_manifest, load_problems
 
 DEFAULT_DATASET_PATH = "datasets/aime/"
 
 
-def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024, n_responses=1, record=True, output_path=None, start=None, end=None, seed=42, **kwargs):
+def eval_aime(model, tokenizer, dataset_path=DEFAULT_DATASET_PATH, version=2024, n_responses=1, record=True, output_path=None, start=None, end=None, seed=42, aime_manifest=None, **kwargs):
     json_data = {}
     problems, answers, ids = [], [], []
     if output_path is not None:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    for subset in [f"aime_{version}_I", f"aime_{version}_II"]:
-        # load question and answer
-        for i in range(1, 16):
-            problem_file = os.path.join(dataset_path, subset, "problems", f"{i}.tex")
-            with open(problem_file, "r") as f:
-                problems.append(f.read())
-                ids.append(f"{subset}.{i}")
+    if aime_manifest is not None:
+        # Manifest order replaces both the year and legacy index slicing.
+        dataset = load_problems(dataset_path, load_manifest(aime_manifest))
+    else:
+        for subset in [f"aime_{version}_I", f"aime_{version}_II"]:
+            # load question and answer
+            for i in range(1, 16):
+                problem_file = os.path.join(dataset_path, subset, "problems", f"{i}.tex")
+                with open(problem_file, "r") as f:
+                    problems.append(f.read())
+                    ids.append(f"{subset}.{i}")
 
-        answer_file = os.path.join(dataset_path, subset, "answers.csv")
-        subset_answers = pd.read_csv(answer_file)["answer"].tolist()
-        answers += [str(answer) for answer in subset_answers]
-    dataset = Dataset.from_dict({"problem": problems, "answer": answers, "id": ids})
-    if start is not None and end is not None:
-        dataset = dataset.select(range(start, end))
+            answer_file = os.path.join(dataset_path, subset, "answers.csv")
+            subset_answers = pd.read_csv(answer_file)["answer"].tolist()
+            answers += [str(answer) for answer in subset_answers]
+        dataset = Dataset.from_dict({"problem": problems, "answer": answers, "id": ids})
+        if start is not None and end is not None:
+            dataset = dataset.select(range(start, end))
 
     for problem_id, sample in enumerate(tqdm(dataset, desc="Evaluating", unit="problem", dynamic_ncols=True)):
         problem = sample["problem"]

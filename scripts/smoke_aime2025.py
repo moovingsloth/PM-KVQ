@@ -14,6 +14,15 @@ import sys
 import termios
 import time
 
+from pm_kvq.evaluation.aime_manifest import (
+    expected_response_keys,
+    load_problems,
+    load_responses,
+    manifest_bytes,
+    provenance,
+    select_mixed_manifest,
+    validate_manifest,
+)
 from pm_kvq.utils.wandb_logging import (
     DEFAULT_ENTITY,
     DEFAULT_PROJECT,
@@ -54,7 +63,9 @@ def _expected_keys(slices, n_responses):
     }
 
 
-def _eval_jobs(method, slices, out):
+def _eval_jobs(method, slices, out, aime_manifest=None):
+    if aime_manifest is not None:
+        return [(f'{method}_evaluation', 0, len(aime_manifest['problem_ids']), out / method / 'responses.json')]
     jobs = []
     for start, end in slices:
         if end - start == 1:
@@ -68,6 +79,41 @@ def _eval_jobs(method, slices, out):
             path = out / method / f'{start}_{end}.json'
         jobs.append((name, start, end, path))
     return jobs
+
+
+def _aime_selection(args):
+    if args.aime_protocol == 'thinkv_mixed':
+        manifest = select_mixed_manifest(args.preset)
+        default_path = ROOT / 'datasets' / 'aime'
+    else:
+        manifest = validate_manifest(dict(schema_version=1, protocol='aime2025', seed=42,
+            problem_ids=[f'aime_2025_{subset}.{problem}'
+                         for start, end in PRESETS[args.preset]['slices']
+                         for index in range(start, end)
+                         for subset, problem in [_problem_id(index)]]))
+        default_path = Path(args.dataset_root) / 'aime'
+    return manifest, Path(args.aime_dataset_path or default_path).resolve()
+
+
+def _evaluation_options(method, args, out, model, aime_data, start, end, output_path):
+    options = ['--model_path', model, '--dataset_path', aime_data, '--benchmark', 'aime',
+               '--n_responses', PRESETS[args.preset]['n_responses'], '--seed', 42,
+               '--method', method, '--output_path', output_path]
+    if args.aime_protocol == 'thinkv_mixed':
+        options += ['--aime_manifest', out / 'aime_manifest.json']
+    else:
+        options += ['--version', 2025, '--start', start, '--end', end]
+    return options + _method_options(method, args, out)
+
+
+def _judge_options(method, args, out):
+    options = ['--benchmark', 'aime', '--responses_dir', out / method]
+    if args.aime_protocol == 'thinkv_mixed':
+        options += ['--aime_manifest', out / 'aime_manifest.json',
+                    '--n_responses', PRESETS[args.preset]['n_responses']]
+    else:
+        options += ['--version', 2025]
+    return options
 
 
 def _set_winsize(fd):
@@ -126,6 +172,10 @@ def build_parser():
                              'full: 512 calib samples, 30 problems × 16 responses')
     parser.add_argument('--model_path', default='/home/dongwon/workspace/models/DeepSeek-R1-Distill-Qwen-14B')
     parser.add_argument('--dataset_root', default='/home/dongwon/workspace/datasets')
+    parser.add_argument('--aime_protocol', choices=['aime2025', 'thinkv_mixed'], default='aime2025',
+                        help='thinkv_mixed: fixed seed-42 selection, 1/5/15 problems per year for smoke/day/full')
+    parser.add_argument('--aime_dataset_path', default=None,
+                        help='Local AIME root; mixed defaults to repository datasets/aime, aime2025 to dataset_root/aime')
     parser.add_argument('--output_dir', default=None)
     parser.add_argument('--methods', nargs='+', choices=['original', 'pm-kvq', 'thinkv'],
                         default=['original', 'pm-kvq'], help='Opt-in method selection; existing pair is the default')
@@ -192,6 +242,14 @@ def main():
         )
         print(f'Published existing smoke run to {url}', flush=True)
         return
+    selection, aime_data = _aime_selection(args)
+    samples = load_problems(aime_data, selection)
+    aime_metadata = provenance(aime_data, selection, samples)
+    if args.aime_protocol == 'aime2025':
+        # The preserved legacy evaluator reads both complete contests before slicing.
+        full_selection = dict(selection, problem_ids=[f'aime_2025_{subset}.{i}'
+                              for subset in ('I', 'II') for i in range(1, 16)])
+        load_problems(aime_data, full_selection)
     os.environ['HF_HOME'] = str(ROOT / '.cache' / 'huggingface')
     os.environ['HF_XET_CACHE'] = str(ROOT / '.cache' / 'huggingface' / 'xet')
     os.environ['HF_DATASETS_CACHE'] = str(ROOT / '.cache' / 'huggingface' / 'datasets')
@@ -211,10 +269,9 @@ def main():
     index = json.loads((model / 'model.safetensors.index.json').read_text())
     for shard in set(index['weight_map'].values()):
         assert (model / shard).is_file(), f'Model download incomplete: {shard}'
-    for subset in ('I', 'II'):
-        assert (data / 'aime' / f'aime_2025_{subset}' / 'problems' / '1.tex').is_file()
     out = Path(args.output_dir).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    (out / 'aime_manifest.json').write_bytes(manifest_bytes(selection))
     if thinkv_artifact is not None:
         (out / 'thinkv_calibration.json').write_text(json.dumps(thinkv_artifact, indent=2, allow_nan=False))
     kv_dim = config['num_key_value_heads'] * config['hidden_size'] // config['num_attention_heads']
@@ -234,6 +291,9 @@ def main():
                     seed=42, max_new_tokens=32768, temperature=0.6, top_p=0.95,
                     backend='fake', status='running', stages=[])
     metadata['git_revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    metadata['aime'] = aime_metadata
+    if args.aime_protocol == 'thinkv_mixed':
+        metadata.pop('problem_indices')  # Legacy 2025 slice indices do not identify mixed problems.
     metadata['methods'] = args.methods
     if 'pm-kvq' not in args.methods:
         metadata.update(calibration_samples=0, memory_budget_mb=None, backend=None)
@@ -257,11 +317,14 @@ def main():
         )
         print(f'W&B: {wandb_run.url}', flush=True)
         copy_into_run(wandb_run, out / 'metadata.json')
+        copy_into_run(wandb_run, out / 'aime_manifest.json')
     emit = make_console_emitter(wandb_run)
     env = child_env(os.environ) if args.wandb else dict(os.environ, PYTHONUNBUFFERED='1')
     env.pop('TQDM_DISABLE', None)
     env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT), env.get('PYTHONPATH')]))
-    n_stages = (4 if 'pm-kvq' in args.methods else 0) + len(args.methods) * (len(slices) + 1)
+    evaluation_manifest = selection if args.aime_protocol == 'thinkv_mixed' else None
+    jobs_per_method = 1 if evaluation_manifest is not None else len(slices)
+    n_stages = (4 if 'pm-kvq' in args.methods else 0) + len(args.methods) * (jobs_per_method + 1)
     stage_i = 0
 
     def run(name, script, *options):
@@ -306,21 +369,16 @@ def main():
             assert all(b > 0 for b in budgets) and sum(budgets) <= budget + 1e-6
             assert all(torch.isfinite(s).all().item() and (s > 0).all().item() for s in scales)
         for method in args.methods:
-            for name, eval_start, eval_end, output_path in _eval_jobs(method, slices, out):
-                options = ['--model_path', model, '--dataset_path', data / 'aime', '--benchmark', 'aime',
-                           '--version', 2025, '--start', eval_start, '--end', eval_end,
-                           '--n_responses', n_responses, '--seed', 42, '--method', method,
-                           '--output_path', output_path]
-                options += _method_options(method, args, out)
+            for name, eval_start, eval_end, output_path in _eval_jobs(method, slices, out, evaluation_manifest):
+                options = _evaluation_options(method, args, out, model, aime_data, eval_start, eval_end, output_path)
                 run(name, 'evaluation.py', *options)
-            run(f'{method}_judge', 'judge.py', '--benchmark', 'aime', '--version', 2025, '--responses_dir', out / method)
-        expected = _expected_keys(slices, n_responses)
+            run(f'{method}_judge', 'judge.py', *_judge_options(method, args, out))
+        expected = expected_response_keys(selection, n_responses)
         summary = {}
+        coverage = dict(aime_metadata, n_responses=n_responses, expected_responses=len(expected), methods={})
         for method in args.methods:
-            records = {}
-            for path in sorted((out / method).glob('*.json')):
-                records.update(json.loads(path.read_text()))
-            assert set(records) == expected, f'{method} coverage {len(records)}/{len(expected)}'
+            records = load_responses(out / method, selection, n_responses)
+            coverage['methods'][method] = dict(responses=len(records), complete=True)
             summary[method] = {
                 'correct': sum(r['judgement'] for r in records.values()), 'responses': len(records),
                 'token_limit_hits': sum(r['hit_token_limit'] for r in records.values()),
@@ -336,10 +394,12 @@ def main():
                     count > 0 for r in records.values() for count in r['thinkv']['evicted_tokens_by_layer'])
                 summary[method]['cache_tensor_bytes'] = {key: r['thinkv']['cache_tensor_bytes'] for key, r in records.items()}
         (out / 'summary.json').write_text(json.dumps(summary, indent=2))
+        (out / 'coverage.json').write_text(json.dumps(coverage, indent=2))
         metadata['status'] = 'complete'
         (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
         if wandb_run is not None:
             copy_into_run(wandb_run, out / 'summary.json')
+            copy_into_run(wandb_run, out / 'coverage.json')
             copy_into_run(wandb_run, out / 'metadata.json')
             log_smoke_outputs(wandb_run, out, metadata, summary)
             wandb_run.finish(exit_code=0)

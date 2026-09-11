@@ -75,7 +75,7 @@ def main():
         diagnostics.write_text(json.dumps({"error": str(error), "model": identity,
                                           "indices": indices, "seed": args.seed}, indent=2))
         raise ValueError(f"{error}; saved diagnostics to {diagnostics}") from error
-    artifact = dict(result, schema_version=1, model=identity, seed=args.seed,
+    artifact = dict(result, schema_version=2, model=identity, seed=args.seed,
                     numerical=numerical_settings(settings), generation=generation,
                     dataset={"path": str(dataset_path), "fingerprint": dataset._fingerprint,
                              "prompt_field": args.prompt_field, "indices": indices,

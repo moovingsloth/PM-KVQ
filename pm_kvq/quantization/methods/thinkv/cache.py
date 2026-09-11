@@ -11,14 +11,34 @@ RETENTION = (64, 32, 16, 8, 4)
 PRIORITY = {"transition": 0, "execution": 1, "reasoning": 2}
 
 
-def attention_sparsity(weights, valid=None):
-    """Head/row mean of entries strictly below 1% of the valid row maximum."""
+def attention_sparsity(scores, valid=None, num_key_value_groups=1):
+    """Raw scores -> GQA max pooling -> FP32 softmax -> KV-head mean.
+
+    ``num_key_value_groups`` is the number of query heads per KV head, as in
+    Transformers. MHA uses one. The boolean validity mask is shared by heads.
+    Threshold only after averaging probabilities, never per query head.
+    """
+    if scores.ndim != 4 or any(size == 0 for size in scores.shape):
+        raise ValueError("attention scores must be nonempty [batch, heads, rows, keys]")
+    if type(num_key_value_groups) is not int or num_key_value_groups <= 0 or scores.shape[1] % num_key_value_groups:
+        raise ValueError("query heads must be divisible by num_key_value_groups")
     if valid is None:
-        valid = torch.ones_like(weights, dtype=torch.bool)
-    valid = valid.expand_as(weights)
+        valid = torch.ones_like(scores[:, :1], dtype=torch.bool)
+    if valid.dtype != torch.bool:
+        raise ValueError("attention validity mask must be boolean")
+    valid = valid.expand_as(scores)
+    if not torch.equal(valid, valid[:, :1].expand_as(valid)):
+        raise ValueError("attention validity mask must be shared by heads")
+    valid = valid[:, 0]
     count = valid.sum(-1)
     if (count == 0).any():
         raise ValueError("attention sparsity has an empty valid row")
+    if not torch.isfinite(scores.masked_select(valid[:, None])).all():
+        raise ValueError("attention sparsity requires finite valid scores")
+    batch, heads, rows, keys = scores.shape
+    pooled = scores.float().masked_fill(~valid[:, None], -torch.inf).reshape(
+        batch, heads // num_key_value_groups, num_key_value_groups, rows, keys).amax(2)
+    weights = pooled.softmax(dim=-1).mean(dim=1)
     maximum = weights.masked_fill(~valid, 0).amax(-1, keepdim=True)
     return (((weights < .01 * maximum) & valid).sum(-1).float() / count).mean().item()
 
